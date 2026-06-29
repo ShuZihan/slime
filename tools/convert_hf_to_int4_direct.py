@@ -174,28 +174,50 @@ def process_file(input_path, output_path, filename, group_size, is_symmetric, ig
         for k in f.keys():
             weights[k] = f.get_tensor(k)
 
+    def _pack_and_store(pname, w):
+        print(f"Packing {pname}, memory usage: {torch.cuda.memory_allocated()}")
+        qw, s, zp = pack_layer(w, group_size, is_symmetric)
+        q_weights[pname.replace(".weight", ".weight_packed")] = qw
+        q_weights[pname.replace(".weight", ".weight_scale")] = s
+        q_weights[pname.replace(".weight", ".weight_shape")] = torch.tensor(
+            w.shape, dtype=torch.int32, device="cuda"
+        )
+        if zp is not None:
+            q_weights[pname.replace(".weight", ".weight_zero_point")] = zp
+
     for name, weight in weights.items():
         is_ignored = any(
             (r.startswith("re:") and re.match(r[3:], name)) or r == name or name.startswith(r) for r in ignore_rules
         )
 
-        if is_ignored or not name.endswith(".weight") or weight.dim() < 2:
+        # Qwen3.5 routed experts are stored fused as 3D tensors WITHOUT a ".weight"
+        # suffix: "...mlp.experts.gate_up_proj" [E, 2F, H] (gate|up concat on dim0) and
+        # "...mlp.experts.down_proj" [E, H, F]. Split per-expert into 2D Linear weights
+        # FIRST (before the dim/ignore checks below, which would otherwise leave them as
+        # 3D BF16), then quantize each. This mirrors the runtime megatron_to_hf/qwen3_5.py
+        # split and matches sglang's per-expert wNa16 MoE loader. Gate on the fused 3D
+        # shape so MTP per-expert weights (already 2D ".weight") and shared_expert are
+        # untouched here.
+        fused_match = re.match(r"(.*\.mlp\.experts)\.(gate_up_proj|down_proj)$", name)
+        if fused_match and weight.dim() == 3 and not is_ignored:
+            prefix, which = fused_match.groups()
+            for i in range(weight.shape[0]):
+                if which == "gate_up_proj":
+                    gate, up = weight[i].chunk(2, dim=0)
+                    _pack_and_store(f"{prefix}.{i}.gate_proj.weight", gate.contiguous())
+                    _pack_and_store(f"{prefix}.{i}.up_proj.weight", up.contiguous())
+                else:
+                    _pack_and_store(f"{prefix}.{i}.down_proj.weight", weight[i].contiguous())
+            continue
+
+        # remaining weights: only quantize non-ignored 2D ".weight" tensors. Use
+        # dim() != 2 (not < 2) so 3D tensors like conv1d.weight stay BF16.
+        if is_ignored or not name.endswith(".weight") or weight.dim() != 2:
             print(f"Ignoring {name}, memory usage: {torch.cuda.memory_allocated()}")
             q_weights[name] = weight
             continue
 
-        print(f"Packing {name}, memory usage: {torch.cuda.memory_allocated()}")
-        qw, s, zp = pack_layer(weight, group_size, is_symmetric)
-        qweight_name = name.replace(".weight", ".weight_packed")
-        scale_name = name.replace(".weight", ".weight_scale")
-        weight_shape = torch.tensor(weight.shape, dtype=torch.int32, device="cuda")
-        weight_shape_name = name.replace(".weight", ".weight_shape")
-        if zp is not None:
-            zp_name = name.replace(".weight", ".weight_zero_point")
-            q_weights[zp_name] = zp
-        q_weights[qweight_name] = qw
-        q_weights[scale_name] = s
-        q_weights[weight_shape_name] = weight_shape
+        _pack_and_store(name, weight)
 
     safetensors.torch.save_file(q_weights, os.path.join(output_path, filename), metadata={"format": "pt"})
 
@@ -282,19 +304,26 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", type=str, required=True, help="local BF16 path")
     parser.add_argument("--save-dir", type=str, required=True)
-    parser.add_argument("--group-size", type=int, default=32, help="Group Size")
+    parser.add_argument("--group-size", type=int, default=128, help="Group Size")
     parser.add_argument("--is-symmetric", action="store_true", help="Whether to use symmetric quantization")
     parser.add_argument(
         "--ignore-rules",
         nargs="+",
+        # Qwen3.5 experts-only: quantize ONLY routed experts
+        # (...mlp.experts.{i}.{gate,up,down}_proj.weight). Everything else stays BF16:
+        # attention, linear_attn (gated-delta), conv1d, visual, router gate, shared_expert,
+        # and MTP (sglang skips "mtp" on load, so quantizing it is wasted).
         default=[
             "re:.*lm_head.*",
             "re:.*norm.*",
             "re:.*embed.*",
             "re:.*self_attn.*",
-            "re:.*shared_experts.*",
-            "re:.*mlp\\.(gate|up|gate_up|down)_proj.*",
-            "re:.*mlp\\.gate\\.*",
+            "re:.*linear_attn.*",
+            "re:.*conv1d.*",
+            "re:.*visual.*",
+            "re:.*mlp\\.gate\\..*",
+            "re:.*shared_expert.*",
+            "re:.*mtp.*",
         ],
         help="Ignore Rules",
     )
