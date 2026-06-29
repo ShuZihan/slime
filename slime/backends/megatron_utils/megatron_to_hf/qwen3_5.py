@@ -69,11 +69,33 @@ def convert_qwen3_5_to_hf(args, name, param):
         layer_idx, rest = match.groups()
         prefix = f"model.language_model.layers.{layer_idx}"
 
-        # experts (grouped gemm - fused format)
-        if rest == "mlp.experts.linear_fc1":
-            return [(f"{prefix}.mlp.experts.gate_up_proj", param)]
-        elif rest == "mlp.experts.linear_fc2":
-            return [(f"{prefix}.mlp.experts.down_proj", param)]
+        # experts (grouped gemm) -- Megatron stores all experts fused as a 3D
+        # tensor: linear_fc1.weight [num_experts, 2*ffn, hidden] (gate|up) and
+        # linear_fc2.weight [num_experts, hidden, ffn] (down). Split per-expert
+        # into individual 2D Linear weights, matching the llmcompressor
+        # compressed-tensors layout that sglang's wNa16 MoE loader expects.
+        #
+        # EP global expert id: common.py:_named_params_and_buffers_global encodes the
+        # source ep_rank's expert_offset into the name as a ".__ep_offset{N}" suffix
+        # (the source ep_rank is NOT otherwise carried into convert_to_hf, so it must
+        # ride on the name). Strip and parse it FIRST, then split with global ids
+        # (offset + local_i) so EP ranks map to disjoint, non-overlapping id ranges.
+        _ep_match = re.search(r"\.__ep_offset(\d+)$", rest)
+        _expert_offset = int(_ep_match.group(1)) if _ep_match else 0
+        _rest_clean = rest[: _ep_match.start()] if _ep_match else rest
+        if re.match(r"mlp\.experts(?:\.experts)*\.linear_fc1(?:\.weight)?$", _rest_clean) and param.dim() == 3:
+            out = []
+            for _i in range(param.shape[0]):
+                _gate, _up = param[_i].chunk(2, dim=0)
+                _gid = _expert_offset + _i
+                out.append((f"{prefix}.mlp.experts.{_gid}.gate_proj.weight", _gate))
+                out.append((f"{prefix}.mlp.experts.{_gid}.up_proj.weight", _up))
+            return out
+        if re.match(r"mlp\.experts(?:\.experts)*\.linear_fc2(?:\.weight)?$", _rest_clean) and param.dim() == 3:
+            return [
+                (f"{prefix}.mlp.experts.{_expert_offset + _i}.down_proj.weight", param[_i])
+                for _i in range(param.shape[0])
+            ]
 
         # experts (ungrouped - individual expert format)
         expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
