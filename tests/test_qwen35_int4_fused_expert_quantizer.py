@@ -6,11 +6,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
 from tools import convert_hf_to_int4_direct as converter
 
 
 def _load_module(module_name, relative_path):
-    module_path = Path(__file__).resolve().parents[1] / relative_path
+    module_path = REPO_ROOT / relative_path
     sys.modules.pop(module_name, None)
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
@@ -59,6 +62,7 @@ def _expert_ids(named_params, suffix):
     return sorted(ids)
 
 
+@pytest.mark.unit
 def test_runtime_fused_experts_keep_ep_global_ids():
     args = _args()
     all_gate_ids = []
@@ -82,6 +86,7 @@ def test_runtime_fused_experts_keep_ep_global_ids():
     assert sorted(all_down_ids) == list(range(NUM_EXPERTS))
 
 
+@pytest.mark.unit
 def test_runtime_fused_expert_split_matches_offline_split():
     args = _args()
     fc1 = torch.arange(LOCAL_EXPERTS * 2 * FFN * HIDDEN, dtype=torch.float32).view(
@@ -109,6 +114,7 @@ def test_runtime_fused_expert_split_matches_offline_split():
         assert torch.equal(out[f"model.language_model.layers.0.mlp.experts.{expert_id}.down_proj.weight"], fc2[expert_id])
 
 
+@pytest.mark.unit
 def test_offline_converter_default_ignore_rules_stay_backward_compatible():
     assert converter.DEFAULT_IGNORE_RULES == [
         "re:.*lm_head.*",
@@ -123,6 +129,7 @@ def test_offline_converter_default_ignore_rules_stay_backward_compatible():
         assert qwen35_only_rule not in converter.DEFAULT_IGNORE_RULES
 
 
+@pytest.mark.unit
 def test_offline_converter_fused_mode_quantizes_only_split_routed_experts(monkeypatch):
     def fake_pack_layer(weight, group_size, sym=True):
         packed = torch.full((weight.shape[0], 1), fill_value=weight.shape[0], dtype=torch.int32)
@@ -168,6 +175,7 @@ def test_offline_converter_fused_mode_quantizes_only_split_routed_experts(monkey
     assert "mtp.layers.0.mlp.down_proj.weight_packed" not in q_weights
 
 
+@pytest.mark.unit
 def test_offline_converter_non_fused_mode_keeps_existing_quantization_behavior(monkeypatch):
     def fake_pack_layer(weight, group_size, sym=True):
         return torch.ones(weight.shape[0], 1, dtype=torch.int32), torch.ones(weight.shape[0], 1), None
@@ -191,6 +199,7 @@ def test_offline_converter_non_fused_mode_keeps_existing_quantization_behavior(m
     assert "model.layers.0.mlp.experts.0.down_proj.weight_packed" in q_weights
 
 
+@pytest.mark.unit
 def test_runtime_quantizer_skips_non_2d_tensors(monkeypatch):
     def fail_pack_layer(weight, group_size, sym=True):
         raise AssertionError("3D tensors must not be packed")
@@ -216,6 +225,7 @@ def test_runtime_quantizer_skips_non_2d_tensors(monkeypatch):
     assert result[0][1].shape == (2, 3, 4)
 
 
+@pytest.mark.unit
 def test_qwen35_effective_quantization_config_keeps_non_experts_bf16():
     effective_ignore = converter.get_effective_ignore_rules(qwen35_fused_expert_only=True)
 
