@@ -31,6 +31,27 @@ def _convert_mtp_layer(args, name, param, layer_idx):
     return None
 
 
+def _split_gate_up(param):
+    return param.chunk(2, dim=0)
+
+
+def _expert_hf_prefix(layer_prefix, expert_id):
+    return f"{layer_prefix}.mlp.experts.{expert_id}"
+
+
+def _emit_expert_gate_up(layer_prefix, expert_id, param):
+    gate, up = _split_gate_up(param)
+    expert_prefix = _expert_hf_prefix(layer_prefix, expert_id)
+    return [
+        (f"{expert_prefix}.gate_proj.weight", gate),
+        (f"{expert_prefix}.up_proj.weight", up),
+    ]
+
+
+def _emit_expert_down(layer_prefix, expert_id, param):
+    return [(f"{_expert_hf_prefix(layer_prefix, expert_id)}.down_proj.weight", param)]
+
+
 def convert_qwen3_5_to_hf(args, name, param):
     """Convert Qwen3.5 model parameters from Megatron to HuggingFace format.
 
@@ -86,16 +107,13 @@ def convert_qwen3_5_to_hf(args, name, param):
         if re.match(r"mlp\.experts(?:\.experts)*\.linear_fc1(?:\.weight)?$", _rest_clean) and param.dim() == 3:
             out = []
             for _i in range(param.shape[0]):
-                _gate, _up = param[_i].chunk(2, dim=0)
-                _gid = _expert_offset + _i
-                out.append((f"{prefix}.mlp.experts.{_gid}.gate_proj.weight", _gate))
-                out.append((f"{prefix}.mlp.experts.{_gid}.up_proj.weight", _up))
+                out.extend(_emit_expert_gate_up(prefix, _expert_offset + _i, param[_i]))
             return out
         if re.match(r"mlp\.experts(?:\.experts)*\.linear_fc2(?:\.weight)?$", _rest_clean) and param.dim() == 3:
-            return [
-                (f"{prefix}.mlp.experts.{_expert_offset + _i}.down_proj.weight", param[_i])
-                for _i in range(param.shape[0])
-            ]
+            out = []
+            for _i in range(param.shape[0]):
+                out.extend(_emit_expert_down(prefix, _expert_offset + _i, param[_i]))
+            return out
 
         # experts (ungrouped - individual expert format)
         expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
@@ -103,13 +121,9 @@ def convert_qwen3_5_to_hf(args, name, param):
         if match:
             rest, expert_idx = match.groups()
             if rest == "linear_fc1":
-                gate_weight, up_weight = param.chunk(2, dim=0)
-                return [
-                    (f"{prefix}.mlp.experts.{expert_idx}.gate_proj.weight", gate_weight),
-                    (f"{prefix}.mlp.experts.{expert_idx}.up_proj.weight", up_weight),
-                ]
+                return _emit_expert_gate_up(prefix, expert_idx, param)
             elif rest == "linear_fc2":
-                return [(f"{prefix}.mlp.experts.{expert_idx}.down_proj.weight", param)]
+                return _emit_expert_down(prefix, expert_idx, param)
             else:
                 raise ValueError(f"Unknown expert parameter name: {name}")
 

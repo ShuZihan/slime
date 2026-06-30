@@ -124,6 +124,37 @@ RUNTIME_ENV_JSON="{
 - `128` for `moonlight-16B-A3B`, `qwen3-30B-A3B`, and `qwen3-235B-A22B-int4`;
 - `32` for `kimi-k2-Thinking-int4`.
 
+### Qwen3.5 MoE INT4-QAT
+
+Qwen3.5 MoE routed experts may be stored as fused 3D tensors in Hugging Face checkpoints. `tools/convert_hf_to_int4_direct.py` detects these tensors automatically and splits them into the per-expert 2D weights expected by the SGLang INT4 MoE loader before quantization:
+
+```text
+*.mlp.experts.gate_up_proj -> *.mlp.experts.{i}.gate_proj.weight
+                              *.mlp.experts.{i}.up_proj.weight
+*.mlp.experts.down_proj    -> *.mlp.experts.{i}.down_proj.weight
+```
+
+The current support scope is Qwen3.5 MoE routed-expert INT4-QAT:
+
+```text
+INT4: mlp.experts.{i}.{gate,up,down}_proj
+BF16: self_attn, linear_attn, conv1d, shared_expert, mlp.gate, visual, mtp, embed, norm, lm_head
+```
+
+Offline conversion, Megatron fake INT4, and runtime weight sync use the same scope: routed experts use INT4, while non-expert weights stay BF16 or use regular BF16 sync. INT4 uses `group_size=128`, symmetric quantization, `scale=max_abs/7`, and RTN.
+
+Minimal conversion command:
+
+```bash
+python tools/convert_hf_to_int4_direct.py \
+  --model-dir /path/to/Qwen3.5-35B-A3B \
+  --save-dir /path/to/Qwen3.5-35B-A3B-INT4 \
+  --group-size 128 \
+  --is-symmetric
+```
+
+The current Qwen3.5 INT4-QAT path does not enable MTP training and does not claim visual INT4-QAT support.
+
 3. Launch an example:
 
 ```bash
@@ -138,6 +169,9 @@ bash scripts/low_precision/run-qwen3-235B-A22B-int4.sh
 
 # Kimi-k2-Thinking INT4 training (32 nodes)
 bash scripts/low_precision/run-kimi-k2-Thinking-int4.sh
+
+# Qwen3.5-35B-A3B routed-expert INT4-QAT training
+bash scripts/low_precision/run-qwen3.5-35B-A3B-int4-qat-rl.sh
 ```
 
 For multi-node environments, start the Ray service according to your cluster configuration.

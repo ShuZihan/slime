@@ -124,6 +124,37 @@ RUNTIME_ENV_JSON="{
 - `128`：`moonlight-16B-A3B`、`qwen3-30B-A3B`、`qwen3-235B-A22B-int4`；
 - `32`：`kimi-k2-Thinking-int4`。
 
+### Qwen3.5 MoE INT4-QAT
+
+Qwen3.5 MoE 的 routed experts 在 Hugging Face checkpoint 中可能使用 fused 3D 权重保存。`tools/convert_hf_to_int4_direct.py` 会自动识别这类权重，并拆成 SGLang INT4 MoE loader 使用的 per-expert 2D 权重后量化：
+
+```text
+*.mlp.experts.gate_up_proj -> *.mlp.experts.{i}.gate_proj.weight
+                              *.mlp.experts.{i}.up_proj.weight
+*.mlp.experts.down_proj    -> *.mlp.experts.{i}.down_proj.weight
+```
+
+当前支持范围是 Qwen3.5 MoE routed experts INT4-QAT：
+
+```text
+INT4: mlp.experts.{i}.{gate,up,down}_proj
+BF16: self_attn、linear_attn、conv1d、shared_expert、mlp.gate、visual、mtp、embed、norm、lm_head
+```
+
+离线转换、Megatron fake INT4、runtime 回灌都遵循同一范围：routed experts 使用 INT4，非专家权重保持 BF16 或普通 BF16 同步。INT4 参数为 `group_size=128`、对称量化、`scale=max_abs/7`、RTN。
+
+最小转换命令：
+
+```bash
+python tools/convert_hf_to_int4_direct.py \
+  --model-dir /path/to/Qwen3.5-35B-A3B \
+  --save-dir /path/to/Qwen3.5-35B-A3B-INT4 \
+  --group-size 128 \
+  --is-symmetric
+```
+
+当前 Qwen3.5 INT4-QAT 路径不启用 MTP training，也不声明支持 visual INT4-QAT。
+
 3. 启动 example：
 
 ```bash
@@ -138,6 +169,9 @@ bash scripts/low_precision/run-qwen3-235B-A22B-int4.sh
 
 # Kimi-k2-Thinking INT4 training (32 nodes)
 bash scripts/low_precision/run-kimi-k2-Thinking-int4.sh
+
+# Qwen3.5-35B-A3B routed experts INT4-QAT training
+bash scripts/low_precision/run-qwen3.5-35B-A3B-int4-qat-rl.sh
 ```
 
 多机环境请根据集群配置启动 Ray 服务。
