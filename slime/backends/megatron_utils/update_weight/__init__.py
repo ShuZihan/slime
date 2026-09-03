@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from slime_plugins.models.qwen4_exp.lifecycle import is_qwen4_exp_model_name
+
 
 def create_weight_updater(
     args: Namespace,
@@ -18,6 +20,12 @@ def create_weight_updater(
     """Select and construct the weight updater for the configured transport."""
     update_weight_mode = args.update_weight_mode
     update_weight_transport = args.update_weight_transport
+
+    if is_qwen4_exp_model_name(model_name) and update_weight_transport == "disk":
+        raise ValueError(
+            "Qwen4-Exp P0 supports tensor or NCCL online updates; "
+            "disk checkpoint updates do not carry the frozen PLE and QSA indexer tensors"
+        )
 
     if update_weight_mode == "delta":
         # Delta sync is disk-transport only: each engine's /pull_weights applies the published

@@ -10,6 +10,7 @@ from .qwen3_5 import convert_qwen3_5_to_hf
 from .qwen3_next import convert_qwen3_next_to_hf
 from .qwen3_vl import convert_qwen3vl_to_hf
 from .qwen3moe import convert_qwen3moe_to_hf
+from .qwen4_exp import convert_qwen4_exp_to_hf
 
 
 # TODO optimize code details
@@ -33,7 +34,9 @@ _cached_tensors = {}
 # TODO optimize code details
 def _convert_to_hf_core(args, model_name, name, param):
     model_name = model_name.lower().replace("_", "").replace("-", "")
-    if "minimaxm2" in model_name:
+    if "qwen4exp" in model_name:
+        converted_named_tensors = convert_qwen4_exp_to_hf(args, name, param)
+    elif "minimaxm2" in model_name:
         converted_named_tensors = convert_minimax_m2_to_hf(args, name, param)
     elif any(family in model_name for family in ("glm4moelite", "deepseekv3", "deepseekv32", "glmmoedsa", "kimi")):
         converted_named_tensors = convert_deepseekv3_to_hf(args, name, param)

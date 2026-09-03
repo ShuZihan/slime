@@ -1422,7 +1422,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--loss-mask-type",
                 type=str,
                 default="qwen",
-                choices=["qwen", "qwen3", "qwen3_5", "distill_qwen"],
+                choices=["qwen", "qwen3", "qwen3_5", "qwen4_exp", "distill_qwen"],
                 help="Loss mask type",
             )
             parser.add_argument(
@@ -1549,6 +1549,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--ci-load-grad-norm",
                 type=str,
                 default=None,
+            )
+            parser.add_argument(
+                "--qwen4-exp-validation-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Write Qwen4-Exp checkpoint, optimizer-transition, and rollout-engine "
+                    "fingerprints as JSONL under this directory."
+                ),
             )
             return parser
 

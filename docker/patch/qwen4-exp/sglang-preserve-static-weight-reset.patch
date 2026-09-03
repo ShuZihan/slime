@@ -1,0 +1,55 @@
+diff --git a/python/sglang/srt/models/qwen4_exp.py b/python/sglang/srt/models/qwen4_exp.py
+index 93b552ee1..4c86ab399 100644
+--- a/python/sglang/srt/models/qwen4_exp.py
++++ b/python/sglang/srt/models/qwen4_exp.py
+@@ -2,6 +2,7 @@
+ 
+ import math
+ from contextlib import nullcontext
++from itertools import chain
+ from typing import Any, Iterable, Optional, Set, Tuple
+ 
+ import msgspec
+@@ -512,7 +513,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
+         return (x ^ (x >> 31)) & cls._MASK64
+ 
+     def _build_layer_multipliers(self, size: int) -> torch.Tensor:
+-        seed = int(getattr(self.config, "seed", 1234))
++        seed = int(getattr(self.config, "seed", None) or 1234)
+         max_long = (1 << 63) - 1
+         m_max = max_long // max(self.unigram_vocab_size, 1)
+         half_bound = max(1, m_max // 2)
+@@ -2115,6 +2116,18 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
+             if isinstance(module, Qwen3_5GatedDeltaNet):
+                 module.finalize_fused_in_proj()
+ 
++        # slime's P0 training graph freezes these tensors and excludes them
++        # from every online update. WeightChecker must retain their startup
++        # values when reset_tensors probes update coverage.
++        for tensor_name, tensor in chain(
++            self.named_parameters(), self.named_buffers()
++        ):
++            if (
++                ".ple.ple_embedding." in tensor_name
++                or ".indexer." in tensor_name
++            ):
++                tensor._preserve_on_weight_reset = True
++
+         return loaded_params
+ 
+     @classmethod
+diff --git a/python/sglang/srt/utils/weight_checker.py b/python/sglang/srt/utils/weight_checker.py
+index bf0f6bb1e..63a5d7143 100644
+--- a/python/sglang/srt/utils/weight_checker.py
++++ b/python/sglang/srt/utils/weight_checker.py
+@@ -96,7 +96,9 @@ class WeightChecker:
+ 
+     def _reset_tensors(self):
+         for name, param in self._model_state():
+-            if _is_non_persistent_buffer_name(name):
++            if _is_non_persistent_buffer_name(name) or getattr(
++                param, "_preserve_on_weight_reset", False
++            ):
+                 continue
+             param.copy_(_random_like(param))
+ 

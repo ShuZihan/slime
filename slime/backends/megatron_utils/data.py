@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -6,9 +9,10 @@ from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from slime.utils import accelerator
-from slime.utils.types import RolloutBatch
-
 from .cp_utils import slice_with_cp
+
+if TYPE_CHECKING:
+    from slime.utils.types import RolloutBatch
 
 
 def get_batch(
@@ -16,6 +20,7 @@ def get_batch(
     keys: Sequence[str],
     pad_multiplier: int = 128,
     allgather_cp: bool = False,
+    pad_token_id: int = 0,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
@@ -24,12 +29,14 @@ def get_batch(
     - Fetch raw fields via iterator.
     - Save original token tensors under "unconcat_tokens".
     - Slice tokens into two chunks for Context Parallelism (CP), concatenate, and pad to a configurable multiple.
-    - Build cu_seqlens and `PackedSeqParams` with T-H-D layout (T: sequence length, H: attention heads, D: head dimension).
+    - Build cu_seqlens and `PackedSeqParams` with T-H-D layout
+      (T: sequence length, H: attention heads, D: head dimension).
 
     Args:
         data_iterator: Iterator providing micro-batch data.
         keys: List of keys to fetch from the iterator.
         pad_multiplier: Multiplier for padding size calculation (default: 128).
+        pad_token_id: Token used for the synthetic padding sample.
 
     Returns a dict including:
     - "tokens": torch.LongTensor of shape [1, T_padded] on the current CUDA device
@@ -42,8 +49,6 @@ def get_batch(
     batch = data_iterator.get_next(keys)
 
     tokens = batch["tokens"]
-    # use 0 as the pad token id should be fine?
-    pad_token_id = 0
     pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
 
     # for cp, we need all tokens to calculate logprob

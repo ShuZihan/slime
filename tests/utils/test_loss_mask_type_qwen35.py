@@ -240,6 +240,29 @@ def test_qwen3_5_matches_expected_mask_for_tool_call_flow():
     ]
 
 
+def test_qwen4_exp_uses_full_rendered_offset_mask_for_tool_call_flow():
+    tokenizer = FakeQwen35Tokenizer()
+    messages = [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": "USER"},
+        {
+            "role": "assistant",
+            "content": "TOOL_CALL",
+            "tool_calls": [{"function": {"name": "terminal", "arguments": {"command": "ls"}}}],
+        },
+        {"role": "tool", "content": "README.md"},
+        {"role": "assistant", "content": "<think>REASONING</think>\nFINAL"},
+    ]
+    expected_text, expected_mask = tokenizer.render_with_expected_mask(messages)
+
+    token_ids, loss_mask = MultiTurnLossMaskGenerator(
+        tokenizer, tokenizer_type="qwen4_exp"
+    ).get_loss_mask(messages)
+
+    assert token_ids == tokenizer(expected_text, add_special_tokens=False)["input_ids"]
+    assert loss_mask == expected_mask
+
+
 def test_qwen3_matches_full_template_for_consecutive_tool_responses():
     tokenizer = FakeQwen35Tokenizer()
     messages = [

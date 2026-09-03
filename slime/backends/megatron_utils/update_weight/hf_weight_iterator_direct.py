@@ -10,6 +10,7 @@ from tqdm import tqdm
 from slime.utils import accelerator
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.types import ParamInfo
+from slime_plugins.models.qwen4_exp.lifecycle import should_online_update_megatron_parameter
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import monkey_patch_torch_reductions
@@ -17,13 +18,26 @@ from .common import all_gather_params_async, named_params_and_buffers
 
 
 class HfWeightIteratorDirect:
-    def __init__(self, args, model, model_name, quantization_config, transform_ue8m0=True):
+    def __init__(
+        self,
+        args,
+        model,
+        model_name,
+        quantization_config,
+        transform_ue8m0=True,
+        include_static=True,
+    ):
         self.args = args
         self.model = model
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.transform_ue8m0 = transform_ue8m0
-        self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(self.args, self.model)
+        parameter_filter = None
+        if not include_static:
+            parameter_filter = lambda name, _parameter: should_online_update_megatron_parameter(model_name, name)
+        self.megatron_local_param_info_buckets = _get_megatron_local_param_info_buckets(
+            self.args, self.model, parameter_filter=parameter_filter
+        )
 
     def get_hf_weight_chunks(
         self,
@@ -134,11 +148,15 @@ def _get_megatron_full_params(
     return gathered_params
 
 
-def _get_megatron_local_param_info_buckets(args: Namespace, model: Sequence[torch.nn.Module]) -> list[list[ParamInfo]]:
+def _get_megatron_local_param_info_buckets(
+    args: Namespace,
+    model: Sequence[torch.nn.Module],
+    parameter_filter: Callable[[str, torch.Tensor], bool] | None = None,
+) -> list[list[ParamInfo]]:
     """
     Partition params into buckets ≤ update_weight_buffer_size (with TP replication).
     """
-    param_infos = _get_megatron_local_param_infos(args, model)
+    param_infos = _get_megatron_local_param_infos(args, model, parameter_filter=parameter_filter)
     return pack_param_info_buckets(param_infos, args.update_weight_buffer_size)
 
 
@@ -171,7 +189,11 @@ def pack_param_info_buckets(
     return param_info_buckets
 
 
-def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Module]) -> list[ParamInfo]:
+def _get_megatron_local_param_infos(
+    args: Namespace,
+    model: Sequence[torch.nn.Module],
+    parameter_filter: Callable[[str, torch.Tensor], bool] | None = None,
+) -> list[ParamInfo]:
     """
     Build global param metadata: collect → exchange PP/EP → resolve duplicates (MTP virtual PP)
     by min src_rank → validate. Returns sorted ParamInfo identical across all ranks.
@@ -182,6 +204,8 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
     param_infos = {}
     rank = dist.get_rank()
     for name, param in named_params_and_buffers(args, model):
+        if parameter_filter is not None and not parameter_filter(name, param):
+            continue
         param_infos[name] = ParamInfo(
             name=name,
             dtype=param.dtype,

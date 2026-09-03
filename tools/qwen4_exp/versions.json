@@ -1,0 +1,20 @@
+{
+  "schema": "qwen4-exp-environment/v1",
+  "slime_base_commit": "4c1ab40203952b3dcc8582b653f3a83f2c6e8128",
+  "megatron_commit": "1dcf0dafa884ad52ffb243625717a3471643e087",
+  "transformers_version": "5.12.1",
+  "sglang": {
+    "pull_request": "https://github.com/sgl-project/sglang/pull/36497",
+    "commit": "78c5024e9d9f589dcb4deb7f4ba4fb23f7e85385",
+    "source": "https://github.com/sgl-project/sglang.git",
+    "patches": [
+      "docker/patch/qwen4-exp/sglang-preserve-static-weight-reset.patch",
+      "docker/patch/qwen4-exp/sglang-qsa-short-extend.patch"
+    ]
+  },
+  "huggingface_transformers_source": {
+    "commit": "a8d5f2c845471633cf744c86be66bf888b8d6a37",
+    "path": "src/transformers/models/qwen4_exp/modular_qwen4_exp.py"
+  },
+  "default_cuda_version": "13.0.3"
+}

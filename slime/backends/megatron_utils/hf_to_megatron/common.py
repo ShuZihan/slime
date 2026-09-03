@@ -30,6 +30,26 @@ class SafetensorReader:
     def __contains__(self, name: str) -> bool:
         return name in self.weight_map
 
+    def get_shape(self, name: str) -> tuple[int, ...]:
+        """Read tensor metadata without materializing the tensor payload."""
+        try:
+            filename = self.weight_map[name]
+        except KeyError as exc:
+            raise KeyError(f"HuggingFace checkpoint does not contain {name!r}") from exc
+        if filename not in self._files:
+            self._files[filename] = safe_open(self.path / filename, framework="pt", device="cpu")
+        return tuple(self._files[filename].get_slice(name).get_shape())
+
+    def get_tensor_slice(self, name: str, index) -> torch.Tensor:
+        """Materialize one indexed region without reading the full source tensor."""
+        try:
+            filename = self.weight_map[name]
+        except KeyError as exc:
+            raise KeyError(f"HuggingFace checkpoint does not contain {name!r}") from exc
+        if filename not in self._files:
+            self._files[filename] = safe_open(self.path / filename, framework="pt", device="cpu")
+        return self._files[filename].get_slice(name)[index]
+
     @functools.lru_cache(maxsize=1)  # noqa: B019 - cache belongs to this reader instance
     def get_tensor(self, name: str) -> torch.Tensor:
         try:
@@ -153,8 +173,18 @@ def load_model_hf_weights(
     from slime.backends.megatron_utils.update_weight.common import named_params_and_buffers
 
     reader = SafetensorReader(path)
+    load_audit = None
+    if getattr(args, "qwen4_exp_validation_dir", None):
+        from slime_plugins.models.qwen4_exp.validation import CheckpointLoadAudit
+
+        load_audit = CheckpointLoadAudit(args)
     with torch.no_grad():
         for name, parameter in named_params_and_buffers(args, model):
+            load_parameter = getattr(get_hf_tensor, "load_parameter", None)
+            if load_parameter is not None and load_parameter(args, name, parameter, reader, config):
+                if load_audit is not None:
+                    load_audit.observe(name, parameter, expected=None, load_mode="streamed_source_slices")
+                continue
             tensor = get_hf_tensor(name, reader, config)
             if name.endswith("output_layer.weight") and parameter.shape[0] == 1 and tensor.shape[0] != 1:
                 continue
@@ -165,3 +195,10 @@ def load_model_hf_weights(
                     f"Megatron {tuple(parameter.shape)}"
                 )
             parameter.copy_(tensor.to(device=parameter.device, dtype=parameter.dtype))
+            if load_audit is not None:
+                load_audit.observe(name, parameter, expected=tensor, load_mode="mapped_exact_copy")
+    finalize_load = getattr(get_hf_tensor, "finalize_load", None)
+    if finalize_load is not None:
+        finalize_load(args, model, reader, config, load_audit=load_audit)
+    if load_audit is not None:
+        load_audit.finish()

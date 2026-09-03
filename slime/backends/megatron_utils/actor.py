@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from megatron.core import mpu
 from torch_memory_saver import torch_memory_saver
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer
 
 from slime.observability import train_data_utils, train_metric_utils
 from slime.observability.logging_utils import init_tracking
@@ -20,6 +20,7 @@ from slime.ray.train_actor import TrainRayActor
 from slime.utils import accelerator
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
+from slime.utils.hf_config import load_hf_config
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import (
@@ -30,6 +31,7 @@ from slime.utils.reloadable_process_group import (
 )
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.types import RolloutBatch
+from slime_plugins.models.qwen4_exp.lifecycle import should_online_update_megatron_parameter
 
 from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
@@ -85,7 +87,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
             if i == dist.get_rank() % args.num_gpus_per_node:
-                self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+                self.hf_config = load_hf_config(args.hf_checkpoint)
                 self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
 
@@ -94,6 +96,11 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+
+        if getattr(args, "qwen4_exp_validation_dir", None):
+            from slime_plugins.models.qwen4_exp.validation import record_model_fingerprints
+
+            record_model_fingerprints(args, self.model, "checkpoint_loaded")
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
@@ -116,9 +123,19 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.sleep()
             return start_rollout_id
 
-        self.weights_backuper = TensorBackuper(
-            source_getter=lambda: named_params_and_buffers(self.args, self.model),
+        weight_model_name = (
+            type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name
         )
+
+        def backup_source():
+            return (
+                (name, parameter)
+                for name, parameter in named_params_and_buffers(self.args, self.model)
+                if should_online_update_megatron_parameter(weight_model_name, name)
+            )
+
+        self.weights_backuper = TensorBackuper(source_getter=backup_source)
+        self._qwen4_exp_last_trained_rollout_id = None
         self._active_model_tag: str | None = "actor"
         self.weights_backuper.backup("actor")
 
@@ -146,7 +163,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args,
             self.model,
             weights_getter=lambda: self.weights_backuper.get("actor"),
-            model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
+            model_name=weight_model_name,
             quantization_config=getattr(self.hf_config, "quantization_config", None),
         )
 
@@ -389,6 +406,11 @@ class MegatronTrainRayActor(TrainRayActor):
         return {}
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> None:
+        if getattr(self.args, "qwen4_exp_validation_dir", None):
+            from slime_plugins.models.qwen4_exp.validation import record_model_fingerprints
+
+            record_model_fingerprints(self.args, self.model, "before_train", rollout_id=rollout_id)
+
         # Create data iterator for log_probs and train.
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
@@ -498,6 +520,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     num_microbatches,
                     global_batch_sizes,
                 )
+            if getattr(self.args, "qwen4_exp_validation_dir", None):
+                from slime_plugins.models.qwen4_exp.validation import record_model_fingerprints
+
+                record_model_fingerprints(self.args, self.model, "after_train", rollout_id=rollout_id)
+                self._qwen4_exp_last_trained_rollout_id = rollout_id
             if capture_log_probs:
                 captured = drain_captured_log_probs()
                 # `captured` is non-empty only on the last PP stage running a loss
@@ -603,9 +630,25 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+            if getattr(self.args, "qwen4_exp_validation_dir", None):
+                from slime_plugins.models.qwen4_exp.validation import record_engine_checksums
+
+                record_engine_checksums(
+                    self.args,
+                    rollout_engines,
+                    "before_weight_sync",
+                    rollout_id=self._qwen4_exp_last_trained_rollout_id,
+                )
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
+            if getattr(self.args, "qwen4_exp_validation_dir", None):
+                record_engine_checksums(
+                    self.args,
+                    rollout_engines,
+                    "after_weight_sync",
+                    rollout_id=self._qwen4_exp_last_trained_rollout_id,
+                )
 
             if getattr(self.args, "keep_old_actor", False):
                 if self.args.update_weights_interval == 1:

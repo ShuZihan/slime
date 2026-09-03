@@ -79,7 +79,11 @@ class UpdateWeightFromTensor:
         self.update_weight_metrics: dict[str, float] = {}
 
         self._hf_weight_iterator = HfWeightIteratorDirect(
-            args=args, model=model, model_name=model_name, quantization_config=quantization_config
+            args=args,
+            model=model,
+            model_name=model_name,
+            quantization_config=quantization_config,
+            include_static=False,
         )
         param_info_buckets = getattr(self._hf_weight_iterator, "megatron_local_param_info_buckets", None)
         self._full_param_info_buckets = (

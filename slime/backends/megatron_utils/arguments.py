@@ -3,7 +3,8 @@ import logging
 
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
-from transformers import AutoConfig
+
+from slime.utils.hf_config import load_hf_config, resolve_pad_token_id
 
 try:
     from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding as _vocab_size_with_padding
@@ -186,6 +187,10 @@ def _set_default_megatron_args(args):
     return args
 
 
+def _set_data_pad_token_id(args, hf_config):
+    args.data_pad_token_id = resolve_pad_token_id(hf_config)
+
+
 # Public alias for external tools (e.g. convert_hf_to_torch_dist.py)
 set_default_megatron_args = _set_default_megatron_args
 
@@ -196,11 +201,13 @@ def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
 
     hf_config = None
     if args.hf_checkpoint and not skip_hf_validate:
-        hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        hf_config = load_hf_config(args.hf_checkpoint)
         _hf_validate_args(args, hf_config)
 
     if not skip_hf_validate:
         _validate_allgather_cp_supported(args, hf_config)
+
+    _set_data_pad_token_id(args, hf_config)
 
     args.rank = 0
     args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node

@@ -93,6 +93,7 @@ class FakeShortConvolution(nn.Module):
 class FakeFusedRMSNormGated(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
+        self.activation = kwargs.get("activation")
 
     def forward(self, x, z):
         return x
@@ -190,6 +191,22 @@ def test_linear_attention_forwards_cu_seqlens_to_chunk_kernel(
     assert output.shape == hidden_states.shape
     assert len(chunk_calls) == 1
     assert torch.equal(chunk_calls[0], cu_seqlens)
+
+
+@pytest.mark.unit
+def test_qwen4_exp_gdn_prefers_explicit_output_gate(monkeypatch):
+    module = load_module("slime_plugins.models.qwen3_5")
+    monkeypatch.setattr(module.accelerator, "current_device", lambda: "cpu")
+    monkeypatch.setattr(module, "ShortConvolution", FakeShortConvolution, raising=False)
+    monkeypatch.setattr(module, "FusedRMSNormGated", FakeFusedRMSNormGated, raising=False)
+    monkeypatch.setattr(module, "get_chunk_gated_delta_rule", lambda _backend: None)
+
+    config = make_config()
+    config.output_gate_type = "sigmoid"
+    layer = module.Qwen3_5GatedDeltaNet(config, layer_idx=0)
+
+    assert layer.activation == "sigmoid"
+    assert layer.norm.activation == "sigmoid"
 
 
 if __name__ == "__main__":

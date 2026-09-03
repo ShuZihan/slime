@@ -68,3 +68,22 @@ def test_create_weight_updater_selects_implementation(monkeypatch, mode, transpo
     assert updater.model_name == "model"
     assert updater.quantization_config == {"quant_method": "test"}
     assert updater.weight_version == 7
+
+
+@pytest.mark.unit
+def test_qwen4_exp_rejects_disk_checkpoint_updates():
+    args = Namespace(
+        update_weight_mode="full",
+        update_weight_transport="disk",
+        update_weight_start_version=0,
+        colocate=False,
+    )
+
+    with pytest.raises(ValueError, match="frozen PLE and QSA indexer"):
+        create_weight_updater(
+            args,
+            [],
+            lambda: {},
+            model_name="Qwen4ExpForConditionalGeneration",
+            quantization_config=None,
+        )

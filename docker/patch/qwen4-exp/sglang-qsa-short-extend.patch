@@ -1,0 +1,91 @@
+diff --git a/python/sglang/srt/layers/attention/qsa/metadata.py b/python/sglang/srt/layers/attention/qsa/metadata.py
+index f976477ad..39b676da2 100644
+--- a/python/sglang/srt/layers/attention/qsa/metadata.py
++++ b/python/sglang/srt/layers/attention/qsa/metadata.py
+@@ -78,6 +78,7 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
+     compress_group_positions: Optional[torch.Tensor] = None
+     compress_sequence_ids: Optional[torch.Tensor] = None
+     compress_member_rows: Optional[torch.Tensor] = None
++    compress_plan_valid: Optional[torch.Tensor] = None
+     is_cuda_graph: bool = False
+     graph_write_locs: Optional[torch.Tensor] = None
+     graph_compressed_page_table: Optional[torch.Tensor] = None
+diff --git a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+index 9ca8ecf4f..b7144bcb6 100644
+--- a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
++++ b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
+@@ -329,6 +329,18 @@ class QSAIndexer(nn.Module):
+             group_locs = member_rows[:, None] + torch.arange(
+                 self.compress_ratio, device=member_rows.device, dtype=torch.long
+             )
++            # The device-side plan has a fixed, shape-derived capacity. Its
++            # padded tail targets reserved compressed slot 0, and must also
++            # read a valid source row when an extend chunk has fewer tokens
++            # than one compression group (including the one-token health
++            # probe). Folding padded rows to source row 0 keeps those writes
++            # inert without touching any completed group's members.
++            if metadata.compress_plan_valid is not None:
++                group_locs = torch.where(
++                    metadata.compress_plan_valid[:, None],
++                    group_locs,
++                    torch.zeros_like(group_locs),
++                )
+             source_keys = token_k
+             source_rope = metadata.extend_rope_matrix
+             if source_rope is None:
+diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+index 7a8106aa0..142914b83 100644
+--- a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
++++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
+@@ -542,7 +542,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+                 row_token_starts[rows] + blocks * compress_ratio - prefix_lens[rows],
+                 torch.zeros_like(blocks),
+             )
+-        return write_locs, group_end_positions, rows, member_rows
++        return write_locs, group_end_positions, rows, member_rows, valid
+ 
+     def _qsa_build_write_plan(
+         self,
+@@ -554,8 +554,9 @@ class QwenSparseAttnBackend(AttentionBackend):
+     ):
+         """Plan the compressed writes for this forward, device-side only.
+ 
+-        Returns (write_locs, group_end_positions, sequence_ids). The only
+-        per-mode part is the block range each row owns, which is device
++        Returns write locations, group positions, sequence ids, extend member
++        rows, and a validity mask. The per-mode part is the block range each
++        row owns, which is device
+         arithmetic over lengths the batch already carries.
+         """
+         ratio = self.token_to_kv_pool.qsa_compress_ratio
+@@ -700,6 +701,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+         group_positions = None
+         group_sequence_ids = None
+         group_member_rows = None
++        group_plan_valid = None
+         decode_page_table = None
+         decode_lengths = None
+         decode_logical_positions = None
+@@ -711,7 +713,13 @@ class QwenSparseAttnBackend(AttentionBackend):
+             self.qsa_profile is None
+             or self.qsa_profile.variant == QSA_VARIANT_COMPRESSED
+         ):
+-            write_locs, group_positions, group_sequence_ids, group_member_rows = (
++            (
++                write_locs,
++                group_positions,
++                group_sequence_ids,
++                group_member_rows,
++                group_plan_valid,
++            ) = (
+                 self._qsa_build_write_plan(
+                     forward_batch=forward_batch,
+                     speculative_paged=speculative_paged,
+@@ -780,6 +788,7 @@ class QwenSparseAttnBackend(AttentionBackend):
+             compress_group_positions=group_positions,
+             compress_sequence_ids=group_sequence_ids,
+             compress_member_rows=group_member_rows,
++            compress_plan_valid=group_plan_valid,
+             decode_page_table=decode_page_table,
+             decode_lengths=decode_lengths,
+             decode_logical_positions=decode_logical_positions,

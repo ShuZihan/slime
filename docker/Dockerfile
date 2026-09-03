@@ -1,4 +1,8 @@
 ARG SGLANG_IMAGE_TAG=v0.5.15.post1-cu129
+
+FROM scratch AS slime_local_source
+COPY . /src
+
 FROM slimerl/sglang:${SGLANG_IMAGE_TAG} AS sglang
 
 # ======================================== Arguments =============================================
@@ -104,6 +108,11 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt
 
+ARG TRANSFORMERS_VERSION=
+RUN if [ -n "${TRANSFORMERS_VERSION}" ]; then \
+      pip install --no-deps "transformers==${TRANSFORMERS_VERSION}"; \
+    fi
+
 # Megatron currently requires NumPy 1.x, while SciPy 1.18+ requires NumPy 2.x.
 # Pin both packages together so downgrading NumPy does not leave an incompatible SciPy.
 RUN pip install "numpy==1.26.4" "scipy==1.17.1"
@@ -153,10 +162,18 @@ fi
 # ====================================== Install main package ============================================
 
 ARG SLIME_COMMIT=main
-RUN git clone https://github.com/THUDM/slime.git /root/slime && \
-    cd /root/slime && \
-    git checkout ${SLIME_COMMIT} && \
-    pip install -e . --no-deps
+ARG SLIME_SOURCE=remote
+COPY --from=slime_local_source /src /tmp/slime-source
+RUN if [ "${SLIME_SOURCE}" = "local" ]; then \
+      mv /tmp/slime-source /root/slime; \
+    elif [ "${SLIME_SOURCE}" = "remote" ]; then \
+      rm -rf /tmp/slime-source && \
+      git clone https://github.com/THUDM/slime.git /root/slime && \
+      cd /root/slime && git checkout ${SLIME_COMMIT}; \
+    else \
+      echo "SLIME_SOURCE must be local or remote, got ${SLIME_SOURCE}" && exit 1; \
+    fi && \
+    cd /root/slime && pip install -e . --no-deps
 
 RUN cd /root/slime/slime/backends/megatron_utils/kernels/int4_qat && \
     pip install . --no-build-isolation

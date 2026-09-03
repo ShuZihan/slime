@@ -7,6 +7,8 @@ from pathlib import Path
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase, ProcessorMixin
 
+from slime.utils.hf_config import ensure_hf_auto_classes
+
 logger = logging.getLogger(__name__)
 
 # Default image patch size for vision-language models
@@ -16,6 +18,7 @@ DEFAULT_PATCH_SIZE = 14
 
 
 def load_tokenizer(name_or_path: str, **kwargs):
+    ensure_hf_auto_classes(name_or_path)
     return AutoTokenizer.from_pretrained(name_or_path, **kwargs)
 
 

@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 from pathlib import Path
 
-from transformers import AutoConfig
+from slime.utils.hf_config import load_hf_config
 
 from .common import load_model_hf_weights
 from .deepseek import deepseek_hf_tensor
@@ -8,6 +10,7 @@ from .glm import glm4_hf_tensor, glm4_moe_hf_tensor
 from .qwen import mimo_hf_tensor, minimax_m2_hf_tensor, qwen_hf_tensor, qwen_moe_hf_tensor
 from .qwen3_5 import qwen3_5_hf_tensor
 from .qwen3_next import qwen3_next_hf_tensor
+from .qwen4_exp import qwen4_exp_hf_loader
 
 _LOADERS = {
     "deepseek_v3": deepseek_hf_tensor,
@@ -27,16 +30,17 @@ _LOADERS = {
     "qwen3_5_moe": qwen3_5_hf_tensor,
     "qwen3_moe": qwen_moe_hf_tensor,
     "qwen3_next": qwen3_next_hf_tensor,
+    "qwen4_exp": qwen4_exp_hf_loader,
 }
 
 
 def supports_hf_weight_loading(path: str | Path) -> bool:
-    config = AutoConfig.from_pretrained(path, trust_remote_code=True)
+    config = load_hf_config(path)
     return config.model_type in _LOADERS
 
 
 def load_hf_weights(args, model, path: str | Path) -> None:
-    config = AutoConfig.from_pretrained(path, trust_remote_code=True)
+    config = load_hf_config(path)
     try:
         get_hf_tensor = _LOADERS[config.model_type]
     except KeyError as exc:

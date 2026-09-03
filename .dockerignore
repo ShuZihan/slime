@@ -1,0 +1,7 @@
+.git
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+qwen4-exp-validation-results

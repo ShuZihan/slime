@@ -234,7 +234,7 @@ class MultiTurnLossMaskGenerator:
             return self.gen_multi_turn_loss_mask_qwen(messages, tools)
         elif self.tokenizer_type == "qwen3":
             return self.gen_multi_turn_loss_mask_qwen3(messages, tools)
-        elif self.tokenizer_type == "qwen3_5":
+        elif self.tokenizer_type in ("qwen3_5", "qwen4_exp"):
             return self.gen_multi_turn_loss_mask_qwen3_5(messages, tools)
         elif self.tokenizer_type == "distill_qwen":
             return self.gen_multi_turn_loss_mask_distill_qwen(messages, tools)

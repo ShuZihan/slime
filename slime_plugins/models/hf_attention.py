@@ -9,32 +9,33 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 
+from slime.utils.hf_config import load_hf_config
+
 
 def _load_hf_config(checkpoint_path):
-    """Load HF config with fallback for unsupported model types."""
+    """Load HF config through slime's runtime model registry."""
     try:
-        from transformers import AutoConfig
-
-        return AutoConfig.from_pretrained(checkpoint_path, trust_remote_code=True)
+        return load_hf_config(checkpoint_path)
     except (ValueError, KeyError):
+        # Preserve the config-only path used by plugins whose upstream
+        # Transformers config class is absent from the runtime.
         config_path = os.path.join(checkpoint_path, "config.json")
-        with open(config_path) as f:
-            config_dict = json.load(f)
+        with open(config_path) as config_file:
+            config_dict = json.load(config_file)
 
-        _DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+        dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
-        def _fix_dtype(d):
-            if "torch_dtype" in d:
-                d["torch_dtype"] = _DTYPE_MAP.get(d["torch_dtype"], d["torch_dtype"])
-            if "dtype" in d:
-                d["dtype"] = _DTYPE_MAP.get(d["dtype"], d["dtype"])
+        def fix_dtype(config):
+            for name in ("torch_dtype", "dtype"):
+                if name in config:
+                    config[name] = dtype_map.get(config[name], config[name])
 
-        _fix_dtype(config_dict)
-        ns = type("HFConfig", (), config_dict)()
+        fix_dtype(config_dict)
+        namespace = type("HFConfig", (), config_dict)()
         if "text_config" in config_dict:
-            _fix_dtype(config_dict["text_config"])
-            ns.text_config = type("TextConfig", (), config_dict["text_config"])()
-        return ns
+            fix_dtype(config_dict["text_config"])
+            namespace.text_config = type("TextConfig", (), config_dict["text_config"])()
+        return namespace
 
 
 class _AllGatherForDuplicatedComputation(torch.autograd.Function):

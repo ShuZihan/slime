@@ -49,8 +49,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_idx = layer_idx
-        self.activation = config.hidden_act
-        self.act = ACT2FN[config.hidden_act]
+        self.activation = getattr(config, "output_gate_type", None) or config.hidden_act
+        self.act = ACT2FN[self.activation]
         self.layer_norm_epsilon = config.rms_norm_eps
 
         # QKV
