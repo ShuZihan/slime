@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-from typing import Optional
 
 import torch
 from megatron.core import tensor_parallel
@@ -22,13 +21,9 @@ from .reference import (
     Qwen4ExpGatedResidual,
     Qwen4ExpPLE,
     Qwen4ExpPackedLayout,
-    Qwen4ExpSparseAttentionReference,
+    Qwen4ExpQSA,
     inject_residual,
 )
-
-
-def _text_config(config):
-    return getattr(config, "text_config", config)
 
 
 def _module_device(config):
@@ -58,7 +53,7 @@ def _scatter_sequence_parallel(hidden_states: torch.Tensor, config, tp_group):
 
 
 class Qwen4ExpTransformerLayer(MegatronModule, BaseTransformerLayer):
-    """One mHC decoder layer with native Megatron MoE and reference Qwen operators."""
+    """One mHC decoder layer with native Megatron MoE and Qwen operators."""
 
     def __init__(
         self,
@@ -69,7 +64,7 @@ class Qwen4ExpTransformerLayer(MegatronModule, BaseTransformerLayer):
         p0_config: Qwen4ExpP0Config,
         layer_type: str,
         mlp_spec: ModuleSpec,
-        ple_layer_index: Optional[int],
+        ple_layer_index: int | None,
         pg_collection=None,
         vp_stage=None,
     ):
@@ -87,12 +82,15 @@ class Qwen4ExpTransformerLayer(MegatronModule, BaseTransformerLayer):
 
         if layer_type == "linear_attention":
             self.linear_attn = _place_replicated_module(
-                Qwen3_5GatedDeltaNet(_text_config(hf_config), layer_number - 1, args=args), config
+                Qwen3_5GatedDeltaNet(
+                    getattr(hf_config, "text_config", hf_config), layer_number - 1, args=args
+                ),
+                config,
             )
             self.self_attention = None
         elif layer_type == "qwen_sparse_attention":
             self.linear_attn = None
-            self.self_attention = _place_replicated_module(Qwen4ExpSparseAttentionReference(p0_config), config)
+            self.self_attention = _place_replicated_module(Qwen4ExpQSA(p0_config), config)
         else:
             raise ValueError(f"unsupported Qwen4-Exp layer type: {layer_type}")
 
@@ -176,7 +174,7 @@ class Qwen4ExpTransformerLayer(MegatronModule, BaseTransformerLayer):
                 cu_seqlens=packed_layout.cu_seqlens,
             ).permute(1, 0, 2)
         else:
-            block_output, _ = self.self_attention(mixed, packed_layout)
+            block_output = self.self_attention(mixed, packed_layout)
         hidden_states = inject_residual(block_output, residual, injection)
 
         mixed, residual, injection = self.mlp_hyper_connection(hidden_states)
@@ -200,7 +198,6 @@ class Qwen4ExpGPTModel(GPTModel):
 
     def __init__(self, *args, p0_config: Qwen4ExpP0Config, **kwargs):
         super().__init__(*args, **kwargs)
-        self.qwen4_exp_config = p0_config
         if self.decoder.final_layernorm is None:
             raise ValueError("Qwen4-Exp requires a final decoder stage")
         self.decoder.final_layernorm = _place_replicated_module(
@@ -230,6 +227,11 @@ def _validate_p0_runtime(args, p0_config: Qwen4ExpP0Config) -> None:
         raise ValueError("Qwen4-Exp P0 requires pipeline_model_parallel_size=1")
     if args.context_parallel_size != 1:
         raise ValueError("Qwen4-Exp P0 requires context_parallel_size=1")
+    if args.seq_length > p0_config.indexer_budget:
+        raise ValueError(
+            "Qwen4-Exp P0 requires seq_length to fit within "
+            f"the {p0_config.indexer_budget}-token QSA budget"
+        )
     if getattr(args, "mtp_num_layers", 0) or getattr(args, "enable_mtp_training", False):
         raise ValueError("Qwen4-Exp P0 excludes MTP training")
     if args.tensor_model_parallel_size > 1 and not args.sequence_parallel:
@@ -266,6 +268,7 @@ def get_qwen4_exp_model_provider(args, config, vp_stage):
         raise ValueError("Qwen4-Exp P0 excludes virtual pipeline parallelism")
     hf_config = _load_hf_config(args.hf_checkpoint)
     p0_config = Qwen4ExpP0Config.from_hf_config(hf_config)
+    p0_config.validate_public_release_contract()
     _validate_p0_runtime(args, p0_config)
 
     block_spec = copy.deepcopy(

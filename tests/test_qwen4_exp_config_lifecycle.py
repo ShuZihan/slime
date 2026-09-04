@@ -7,7 +7,6 @@ from slime_plugins.models.qwen4_exp.lifecycle import (
     ParameterLifecycle,
     build_lifecycle_manifest,
     lifecycle_summary,
-    online_update_source_names,
     should_online_update_megatron_parameter,
 )
 
@@ -70,7 +69,6 @@ def test_config_reads_public_names_and_derives_p0_contract():
     assert config.layer_types[3] == "qwen_sparse_attention"
     assert config.hyper_connection_width == 10240
     assert config.ple_num_heads == 16
-    assert config.index_block_topk == 512
     assert config.rope_theta == 10_000_000
     assert config.pad_token_id == config.eos_token_id == 248044
     assert config.norm_topk_prob
@@ -102,6 +100,16 @@ def test_config_rejects_ple_on_qsa_layer():
 
 
 @pytest.mark.unit
+def test_config_rejects_non_public_gdn_gate():
+    raw = public_text_config()
+    raw["text_config"]["layer_types"] *= 12
+    raw["text_config"]["output_gate_type"] = "silu"
+
+    with pytest.raises(ValueError, match="sigmoid GDN output gating"):
+        Qwen4ExpP0Config.from_hf_config(raw)
+
+
+@pytest.mark.unit
 def test_lifecycle_manifest_covers_p0_checkpoint_and_sync_set():
     raw = public_text_config()
     raw["text_config"]["layer_types"] *= 12
@@ -127,7 +135,11 @@ def test_lifecycle_manifest_covers_p0_checkpoint_and_sync_set():
 
     records = build_lifecycle_manifest(weight_map, config)
     summary = lifecycle_summary(records)
-    update_names = online_update_source_names(records)
+    update_names = [
+        record.source_name
+        for record in records
+        if record.lifecycle is ParameterLifecycle.TRAINABLE_SYNC
+    ]
 
     assert summary[ParameterLifecycle.STATIC_SHARED.value] == 128 + 12 * 3
     assert summary[ParameterLifecycle.DERIVED_BUFFER.value] == 1

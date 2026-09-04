@@ -10,10 +10,6 @@ from slime_plugins.models.qwen4_exp.reference import Qwen4ExpNGramLayout
 from .common import SafetensorReader, strip_mcore_wrappers
 
 
-def _text_config(config):
-    return getattr(config, "text_config", config)
-
-
 def _merge_gated_qkv(reader: SafetensorReader, prefix: str, config) -> torch.Tensor:
     """Pack checkpoint q/gate, k, and v into MCore's per-KV-group layout."""
 
@@ -71,7 +67,7 @@ class Qwen4ExpHfLoader:
             raise KeyError(f"unsupported Qwen4-Exp Megatron parameter {name!r}")
         layer_idx, rest = layer_match.groups()
         prefix = f"model.language_model.layers.{layer_idx}"
-        config = _text_config(hf_config)
+        config = getattr(hf_config, "text_config", hf_config)
 
         for direct_prefix in ("attn_hyper_connection.", "mlp_hyper_connection.", "linear_attn.", "ple."):
             if rest.startswith(direct_prefix) and rest != self._PLE_PARAMETER:
@@ -167,7 +163,7 @@ class Qwen4ExpHfLoader:
             raise ValueError(f"PLE shard index mismatch; missing={missing}, extra={extra}")
 
         parameter.zero_()
-        shard_rows = math_ceil_div(global_rows, p0_config.split_ngram_parts)
+        shard_rows = (global_rows + p0_config.split_ngram_parts - 1) // p0_config.split_ngram_parts
         covered_until = local_start
         for shard_idx in range(p0_config.split_ngram_parts):
             source_name = source_shards[shard_idx]
@@ -235,10 +231,6 @@ class Qwen4ExpHfLoader:
         expected_count = len(config.ple_layer_ids) * len(self._PLE_DERIVED_BUFFERS)
         if len(observed) != expected_count:
             raise ValueError(f"verified {len(observed)} derived PLE buffers; expected {expected_count}")
-
-
-def math_ceil_div(numerator: int, denominator: int) -> int:
-    return (numerator + denominator - 1) // denominator
 
 
 qwen4_exp_hf_loader = Qwen4ExpHfLoader()

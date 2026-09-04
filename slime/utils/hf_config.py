@@ -26,10 +26,7 @@ def resolve_pad_token_id(hf_config: Any, *, default: int = 0) -> int:
 
 
 def _read_local_config(name_or_path: str | Path) -> dict[str, Any] | None:
-    try:
-        path = Path(name_or_path).expanduser()
-    except TypeError:
-        return None
+    path = Path(name_or_path).expanduser()
     config_path = path / "config.json" if path.is_dir() else path
     if config_path.name != "config.json" or not config_path.is_file():
         return None
@@ -43,29 +40,16 @@ def _register_tokenizer(config_class) -> None:
 
     from transformers import AutoTokenizer, Qwen2Tokenizer, Qwen2TokenizerFast
 
-    try:
-        AutoTokenizer.register(
-            config_class,
-            slow_tokenizer_class=Qwen2Tokenizer,
-            fast_tokenizer_class=Qwen2TokenizerFast,
-            exist_ok=True,
-        )
-    except TypeError:
-        # Transformers releases predating ``exist_ok`` still accept repeated
-        # registration when the same class tuple is supplied.
-        try:
-            AutoTokenizer.register(
-                config_class,
-                slow_tokenizer_class=Qwen2Tokenizer,
-                fast_tokenizer_class=Qwen2TokenizerFast,
-            )
-        except ValueError as error:
-            if "already" not in str(error).lower():
-                raise
+    AutoTokenizer.register(
+        config_class,
+        slow_tokenizer_class=Qwen2Tokenizer,
+        fast_tokenizer_class=Qwen2TokenizerFast,
+        exist_ok=True,
+    )
 
 
 @lru_cache(maxsize=1)
-def _register_qwen4_exp_fallback():
+def _register_qwen4_exp_fallback() -> None:
     """Register a config-only Qwen4-Exp type when SGLang is unavailable."""
 
     import torch
@@ -109,16 +93,11 @@ def _register_qwen4_exp_fallback():
         (Qwen4ExpTextConfig.model_type, Qwen4ExpTextConfig),
         (Qwen4ExpConfig.model_type, Qwen4ExpConfig),
     ):
-        try:
-            AutoConfig.register(model_type, config_class)
-        except ValueError as error:
-            if "already" not in str(error).lower() and "used" not in str(error).lower():
-                raise
+        AutoConfig.register(model_type, config_class, exist_ok=True)
     _register_tokenizer(Qwen4ExpConfig)
-    return Qwen4ExpConfig
 
 
-def ensure_hf_auto_classes(name_or_path: str | Path) -> bool:
+def ensure_hf_auto_classes(name_or_path: str | Path) -> None:
     """Register Qwen4-Exp config/tokenizer classes for a local checkpoint.
 
     SGLang owns the serving-time config implementation pinned by the P0 build.
@@ -128,7 +107,7 @@ def ensure_hf_auto_classes(name_or_path: str | Path) -> bool:
 
     config = _read_local_config(name_or_path)
     if config is None or config.get("model_type") not in _QWEN4_EXP_MODEL_TYPES:
-        return False
+        return
 
     try:
         from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
@@ -137,7 +116,7 @@ def ensure_hf_auto_classes(name_or_path: str | Path) -> bool:
         if missing_module != "sglang" and not missing_module.startswith("sglang."):
             raise
         _register_qwen4_exp_fallback()
-        return True
+        return
 
     from transformers import AutoConfig
 
@@ -145,13 +124,8 @@ def ensure_hf_auto_classes(name_or_path: str | Path) -> bool:
         (Qwen4ExpTextConfig.model_type, Qwen4ExpTextConfig),
         (Qwen4ExpConfig.model_type, Qwen4ExpConfig),
     ):
-        try:
-            AutoConfig.register(model_type, config_class)
-        except ValueError as error:
-            if "already" not in str(error).lower() and "used" not in str(error).lower():
-                raise
+        AutoConfig.register(model_type, config_class, exist_ok=True)
     _register_tokenizer(Qwen4ExpConfig)
-    return True
 
 
 def load_hf_config(name_or_path: str | Path, *, trust_remote_code: bool = True, **kwargs):

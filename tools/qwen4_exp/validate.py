@@ -16,7 +16,6 @@ import tarfile
 import time
 import traceback
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Callable
 
 
@@ -515,14 +514,6 @@ def _preflight(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
     return details
 
 
-def _namespace(value: Any) -> Any:
-    if isinstance(value, dict):
-        return SimpleNamespace(**{key: _namespace(item) for key, item in value.items()})
-    if isinstance(value, list):
-        return [_namespace(item) for item in value]
-    return value
-
-
 def _resolve_checkpoint_metadata(args: argparse.Namespace) -> tuple[Path, Path]:
     config_path = args.config_json
     index_path = args.index_json
@@ -554,13 +545,14 @@ def _validate_public_checkpoint_contract(details: dict[str, Any]) -> None:
 def _manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
     from slime_plugins.models.qwen4_exp.config import Qwen4ExpP0Config
     from slime_plugins.models.qwen4_exp.lifecycle import (
+        ParameterLifecycle,
         build_lifecycle_manifest,
         lifecycle_summary,
         manifest_sha256,
     )
 
     config_path, index_path = _resolve_checkpoint_metadata(args)
-    config = Qwen4ExpP0Config.from_hf_config(_namespace(json.loads(config_path.read_text(encoding="utf-8"))))
+    config = Qwen4ExpP0Config.from_hf_config(json.loads(config_path.read_text(encoding="utf-8")))
     if args.mode == "intranet":
         config.validate_public_release_contract()
     index = json.loads(index_path.read_text(encoding="utf-8"))
@@ -594,8 +586,8 @@ def _manifest(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
                         "source_file": record.source_file,
                         "lifecycle": record.lifecycle.value,
                         "reason": record.reason,
-                        "optimizer": record.included_in_optimizer,
-                        "online_update": record.included_in_online_update,
+                        "optimizer": record.lifecycle is ParameterLifecycle.TRAINABLE_SYNC,
+                        "online_update": record.lifecycle is ParameterLifecycle.TRAINABLE_SYNC,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -665,7 +657,6 @@ def _e2e(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
             "ROLLOUT_EP_SIZE": str(args.expected_gpus),
             "ROLLOUT_NUM_GPUS": str(args.expected_gpus),
             "ROLLOUT_NUM_GPUS_PER_ENGINE": str(args.expected_gpus),
-            "SLIME_QWEN4_EXP_VALIDATION_DIR": str(run_dir),
             "MAX_TRAIN_ROLLOUT_DIFF": str(args.logprob_threshold),
         }
     )

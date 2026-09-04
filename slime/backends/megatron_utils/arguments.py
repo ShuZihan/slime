@@ -187,10 +187,6 @@ def _set_default_megatron_args(args):
     return args
 
 
-def _set_data_pad_token_id(args, hf_config):
-    args.data_pad_token_id = resolve_pad_token_id(hf_config)
-
-
 # Public alias for external tools (e.g. convert_hf_to_torch_dist.py)
 set_default_megatron_args = _set_default_megatron_args
 
@@ -207,7 +203,7 @@ def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
     if not skip_hf_validate:
         _validate_allgather_cp_supported(args, hf_config)
 
-    _set_data_pad_token_id(args, hf_config)
+    args.data_pad_token_id = resolve_pad_token_id(hf_config)
 
     args.rank = 0
     args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node

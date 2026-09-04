@@ -32,6 +32,7 @@ from slime.utils.reloadable_process_group import (
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.types import RolloutBatch
 from slime_plugins.models.qwen4_exp.lifecycle import should_online_update_megatron_parameter
+from slime_plugins.models.qwen4_exp.validation import record_engine_checksums, record_model_fingerprints
 
 from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
@@ -97,9 +98,8 @@ class MegatronTrainRayActor(TrainRayActor):
             args, role
         )
 
-        if getattr(args, "qwen4_exp_validation_dir", None):
-            from slime_plugins.models.qwen4_exp.validation import record_model_fingerprints
-
+        self._qwen4_exp_validation_enabled = bool(getattr(args, "qwen4_exp_validation_dir", None))
+        if self._qwen4_exp_validation_enabled:
             record_model_fingerprints(args, self.model, "checkpoint_loaded")
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
@@ -406,9 +406,7 @@ class MegatronTrainRayActor(TrainRayActor):
         return {}
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> None:
-        if getattr(self.args, "qwen4_exp_validation_dir", None):
-            from slime_plugins.models.qwen4_exp.validation import record_model_fingerprints
-
+        if self._qwen4_exp_validation_enabled:
             record_model_fingerprints(self.args, self.model, "before_train", rollout_id=rollout_id)
 
         # Create data iterator for log_probs and train.
@@ -520,9 +518,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     num_microbatches,
                     global_batch_sizes,
                 )
-            if getattr(self.args, "qwen4_exp_validation_dir", None):
-                from slime_plugins.models.qwen4_exp.validation import record_model_fingerprints
-
+            if self._qwen4_exp_validation_enabled:
                 record_model_fingerprints(self.args, self.model, "after_train", rollout_id=rollout_id)
                 self._qwen4_exp_last_trained_rollout_id = rollout_id
             if capture_log_probs:
@@ -630,9 +626,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
-            if getattr(self.args, "qwen4_exp_validation_dir", None):
-                from slime_plugins.models.qwen4_exp.validation import record_engine_checksums
-
+            if self._qwen4_exp_validation_enabled:
                 record_engine_checksums(
                     self.args,
                     rollout_engines,
@@ -642,7 +636,7 @@ class MegatronTrainRayActor(TrainRayActor):
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
-            if getattr(self.args, "qwen4_exp_validation_dir", None):
+            if self._qwen4_exp_validation_enabled:
                 record_engine_checksums(
                     self.args,
                     rollout_engines,

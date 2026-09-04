@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import time
 from collections import Counter
@@ -16,8 +15,6 @@ import torch
 from .lifecycle import should_online_update_megatron_parameter
 
 
-_VALIDATION_DIR_ENV = "SLIME_QWEN4_EXP_VALIDATION_DIR"
-_FINGERPRINT_REGEX_ENV = "SLIME_QWEN4_EXP_FINGERPRINT_REGEX"
 _DEFAULT_FINGERPRINT_REGEX = re.compile(
     r"(?:embedding\.word_embeddings|output_layer|decoder\.final_layernorm|"
     r"decoder\.layers\.(?:0|1|3)\.(?!mlp\.experts\.local_experts\.(?!0\.))|"
@@ -36,9 +33,8 @@ _PLE_BUFFER_SUFFIXES = (
 )
 
 
-def validation_dir(args: Any = None) -> Path | None:
-    configured = getattr(args, "qwen4_exp_validation_dir", None) if args is not None else None
-    configured = configured or os.environ.get(_VALIDATION_DIR_ENV)
+def validation_dir(args: Any) -> Path | None:
+    configured = getattr(args, "qwen4_exp_validation_dir", None)
     return Path(configured).expanduser().resolve() if configured else None
 
 
@@ -109,16 +105,14 @@ class CheckpointLoadAudit:
 
     def __init__(self, args: Any):
         self.output_dir = validation_dir(args)
+        if self.output_dir is None:
+            raise ValueError("CheckpointLoadAudit requires qwen4_exp_validation_dir")
         self.rank = _dist_rank()
         self.parameter_count = 0
         self.parameter_numel = 0
         self.lifecycle_counts: Counter[str] = Counter()
         self.sampled = []
         self.streamed = []
-
-    @property
-    def enabled(self) -> bool:
-        return self.output_dir is not None
 
     @torch.no_grad()
     def observe(
@@ -129,8 +123,6 @@ class CheckpointLoadAudit:
         expected: torch.Tensor | None,
         load_mode: str,
     ) -> None:
-        if not self.enabled:
-            return
         lifecycle = _lifecycle(name, actual, is_buffer=False)
         self.parameter_count += 1
         self.parameter_numel += actual.numel()
@@ -172,9 +164,7 @@ class CheckpointLoadAudit:
         if not exact:
             raise ValueError(f"Qwen4-Exp HF to Megatron sampled value mismatch for {canonical}")
 
-    def finish(self) -> dict[str, Any] | None:
-        if not self.enabled:
-            return None
+    def finish(self) -> dict[str, Any]:
         if not self.sampled or not self.streamed:
             raise ValueError("Qwen4-Exp load audit did not cover sampled tensors and streamed PLE")
         payload = {
@@ -188,7 +178,6 @@ class CheckpointLoadAudit:
             "sampled": self.sampled,
             "streamed": self.streamed,
         }
-        assert self.output_dir is not None
         _append_jsonl(self.output_dir / "checkpoint" / f"rank-{self.rank:05d}.jsonl", payload)
         return payload
 
@@ -207,11 +196,6 @@ def _iter_state(model: Sequence[torch.nn.Module] | torch.nn.Module):
                 yield full_name, tensor, is_buffer
 
 
-def _fingerprint_pattern() -> re.Pattern[str]:
-    configured = os.environ.get(_FINGERPRINT_REGEX_ENV)
-    return re.compile(configured) if configured else _DEFAULT_FINGERPRINT_REGEX
-
-
 @torch.no_grad()
 def record_model_fingerprints(
     args: Any,
@@ -219,12 +203,11 @@ def record_model_fingerprints(
     event: str,
     *,
     rollout_id: int | None = None,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     output_dir = validation_dir(args)
     if output_dir is None:
-        return None
+        raise ValueError("record_model_fingerprints requires qwen4_exp_validation_dir")
 
-    pattern = _fingerprint_pattern()
     tensors = []
     lifecycle_counts: Counter[str] = Counter()
     lifecycle_numel: Counter[str] = Counter()
@@ -232,7 +215,7 @@ def record_model_fingerprints(
         lifecycle = _lifecycle(name, tensor, is_buffer)
         lifecycle_counts[lifecycle] += 1
         lifecycle_numel[lifecycle] += tensor.numel()
-        if not pattern.search(name):
+        if not _DEFAULT_FINGERPRINT_REGEX.search(name):
             continue
         record = {
             "name": name,
@@ -272,9 +255,11 @@ def record_engine_checksums(
     *,
     rollout_id: int | None = None,
 ) -> dict[str, Any] | None:
-    output_dir = validation_dir(args)
-    if output_dir is None or _dist_rank() != 0:
+    if _dist_rank() != 0:
         return None
+    output_dir = validation_dir(args)
+    if output_dir is None:
+        raise ValueError("record_engine_checksums requires qwen4_exp_validation_dir")
 
     import ray
 
@@ -291,17 +276,3 @@ def record_engine_checksums(
     }
     _append_jsonl(output_dir / "rollout" / "engine-checksums.jsonl", payload)
     return payload
-
-
-def write_driver_event(
-    output_dir: str | Path,
-    event: str,
-    **fields: Any,
-) -> None:
-    payload = {
-        "schema": "qwen4-exp-validation/v1",
-        "event": event,
-        "time_unix_ns": time.time_ns(),
-        **fields,
-    }
-    _append_jsonl(Path(output_dir) / "driver.jsonl", payload)

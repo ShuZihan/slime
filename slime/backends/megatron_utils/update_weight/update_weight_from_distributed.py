@@ -185,7 +185,7 @@ class UpdateWeightFromDistributed:
         params = (
             (name, parameter)
             for name, parameter in named_params_and_buffers(self.args, self.model)
-            if ".experts." in name and should_online_update_megatron_parameter(self.model_name, name)
+            if ".experts." in name
         )
         buffer_size = 0
         batch: list[tuple[str, torch.Tensor]] = []

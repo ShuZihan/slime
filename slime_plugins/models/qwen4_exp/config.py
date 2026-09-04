@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence, Tuple
+from typing import Any, Mapping, Sequence
 
 
 def _get(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
     return getattr(value, name, default)
-
-
-def _as_tuple(value: Iterable[Any]) -> Tuple[Any, ...]:
-    return tuple(value)
 
 
 def _normalize_layer_type(layer_type: str) -> str:
@@ -39,7 +35,7 @@ class Qwen4ExpP0Config:
 
     hidden_size: int
     num_hidden_layers: int
-    layer_types: Tuple[str, ...]
+    layer_types: tuple[str, ...]
     rms_norm_eps: float
 
     hyper_connection_count: int
@@ -63,7 +59,7 @@ class Qwen4ExpP0Config:
     indexer_budget: int
     indexer_compress_ratio: int
 
-    ple_layer_ids: Tuple[int, ...]
+    ple_layer_ids: tuple[int, ...]
     ple_embed_dim: int
     ple_conv_kernel_size: int
     ngram_size: int
@@ -91,12 +87,6 @@ class Qwen4ExpP0Config:
         return self.hidden_size * self.hyper_connection_count
 
     @property
-    def index_block_topk(self) -> int:
-        if self.indexer_budget % self.indexer_compress_ratio:
-            raise ValueError("indexer_budget must be divisible by indexer_compress_ratio")
-        return self.indexer_budget // self.indexer_compress_ratio
-
-    @property
     def ple_num_heads(self) -> int:
         return (self.ngram_size - 1) * self.heads_per_ngram
 
@@ -105,11 +95,7 @@ class Qwen4ExpP0Config:
         text_config = _get(config, "text_config", config)
         layer_types = _get(text_config, "layer_types")
         if layer_types is None:
-            pattern = _get(text_config, "full_attention_interval", 4)
-            layer_types = [
-                "qwen_sparse_attention" if (layer_idx + 1) % pattern == 0 else "linear_attention"
-                for layer_idx in range(_get(text_config, "num_hidden_layers"))
-            ]
+            raise ValueError("Qwen4-Exp P0 requires the checkpoint layer_types list")
 
         eos_token_id = _get(text_config, "eos_token_id", _get(config, "eos_token_id"))
         if isinstance(eos_token_id, Sequence) and not isinstance(eos_token_id, (str, bytes)):
@@ -137,7 +123,7 @@ class Qwen4ExpP0Config:
         result = cls(
             hidden_size=int(_get(text_config, "hidden_size")),
             num_hidden_layers=int(_get(text_config, "num_hidden_layers")),
-            layer_types=_as_tuple(_normalize_layer_type(item) for item in layer_types),
+            layer_types=tuple(_normalize_layer_type(item) for item in layer_types),
             rms_norm_eps=float(_get(text_config, "rms_norm_eps")),
             hyper_connection_count=int(_get(text_config, "hc_count")),
             hc_lowrank=int(_get(text_config, "hc_lowrank")),
@@ -156,7 +142,7 @@ class Qwen4ExpP0Config:
             indexer_head_dim=int(_get(text_config, "indexer_head_dim")),
             indexer_budget=int(_get(text_config, "indexer_budget")),
             indexer_compress_ratio=int(_get(text_config, "indexer_compress_ratio")),
-            ple_layer_ids=_as_tuple(int(item) for item in _get(text_config, "ple_layer_ids", ())),
+            ple_layer_ids=tuple(int(item) for item in _get(text_config, "ple_layer_ids", ())),
             ple_embed_dim=int(_get(text_config, "ple_embed_dim")),
             ple_conv_kernel_size=int(_get(text_config, "ple_conv_kernel_size", 4)),
             ngram_size=int(_get(text_config, "ngram_size", 3)),
@@ -176,7 +162,7 @@ class Qwen4ExpP0Config:
             shared_expert_intermediate_size=int(_get(text_config, "shared_expert_intermediate_size")),
             norm_topk_prob=bool(_get(text_config, "norm_topk_prob", True)),
             hidden_act=hidden_act,
-            output_gate_type=str(_get(text_config, "output_gate_type") or hidden_act),
+            output_gate_type=str(_get(text_config, "output_gate_type")),
             attention_bias=bool(_get(text_config, "attention_bias", False)),
             tie_word_embeddings=bool(
                 _get(text_config, "tie_word_embeddings", _get(config, "tie_word_embeddings", False))
@@ -269,7 +255,8 @@ class Qwen4ExpP0Config:
             raise ValueError("the Qwen4-Exp P0 QSA reference requires one indexer KV head")
         if self.indexer_budget <= 0 or self.indexer_compress_ratio <= 0:
             raise ValueError("QSA budget and selection block size must be positive")
-        _ = self.index_block_topk
+        if self.indexer_budget % self.indexer_compress_ratio:
+            raise ValueError("indexer_budget must be divisible by indexer_compress_ratio")
         if self.ngram_size <= 1 or self.heads_per_ngram <= 0:
             raise ValueError("PLE ngram size and heads per ngram must be positive")
         if self.ple_embed_dim % self.ple_num_heads:
@@ -290,8 +277,8 @@ class Qwen4ExpP0Config:
             raise ValueError("num_experts_per_tok exceeds num_experts")
         if self.hidden_act != "silu":
             raise ValueError("Qwen4-Exp P0 requires silu expert activation")
-        if self.output_gate_type not in {"sigmoid", "silu"}:
-            raise ValueError("unsupported Qwen4-Exp GDN output gate activation")
+        if self.output_gate_type != "sigmoid":
+            raise ValueError("Qwen4-Exp P0 requires sigmoid GDN output gating")
         if self.attention_bias:
             raise ValueError("Qwen4-Exp P0 requires bias-free attention projections")
         if self.tie_word_embeddings:

@@ -87,6 +87,7 @@ def _runtime_args(p0_config):
         untie_embeddings_and_output_weights=True,
         hf_checkpoint="unused",
         transformer_impl="local",
+        seq_length=4,
         padded_vocab_size=p0_config.vocab_size,
         max_position_embeddings=32,
         fp16_lm_cross_entropy=False,
@@ -103,6 +104,16 @@ def test_runtime_contract_rejects_router_probability_mismatch():
         qwen4_model._validate_p0_runtime(args, p0_config)
 
 
+@pytest.mark.unit
+def test_runtime_contract_rejects_sequence_above_qsa_budget():
+    p0_config = tiny_config()
+    args = _runtime_args(p0_config)
+    args.seq_length = p0_config.indexer_budget + 1
+
+    with pytest.raises(ValueError, match="QSA budget"):
+        qwen4_model._validate_p0_runtime(args, p0_config)
+
+
 @pytest.mark.integration
 def test_full_megatron_shell_builds_and_runs_tiny_packed_graph(monkeypatch):
     if dist.is_initialized():
@@ -111,6 +122,11 @@ def test_full_megatron_shell_builds_and_runs_tiny_packed_graph(monkeypatch):
     hf_text_config = SimpleNamespace(**p0_config.__dict__)
     hf_text_config.hc_count = p0_config.hyper_connection_count
     monkeypatch.setattr(qwen4_model, "Qwen3_5GatedDeltaNet", FakeGatedDeltaNet)
+    monkeypatch.setattr(
+        qwen4_model.Qwen4ExpP0Config,
+        "validate_public_release_contract",
+        lambda _config: None,
+    )
     monkeypatch.setattr(
         qwen4_model,
         "_load_hf_config",

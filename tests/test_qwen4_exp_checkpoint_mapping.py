@@ -122,7 +122,7 @@ def test_ple_loader_materializes_only_overlapping_source_shards():
 
 @pytest.mark.unit
 def test_ple_config_derived_buffers_match_checkpoint_exactly():
-    from slime_plugins.models.qwen4_exp.reference import Qwen4ExpNGramEmbedding
+    from slime_plugins.models.qwen4_exp.reference import Qwen4ExpPLE
 
     config = tiny_config()
     hf_config = {"text_config": dict(config.__dict__)}
@@ -132,7 +132,7 @@ def test_ple_config_derived_buffers_match_checkpoint_exactly():
     model.decoder = torch.nn.Module()
     model.decoder.layers = torch.nn.ModuleList([torch.nn.Identity(), torch.nn.Module()])
     model.decoder.layers[1].ple = torch.nn.Module()
-    embedding = Qwen4ExpNGramEmbedding(config)
+    embedding = Qwen4ExpPLE(config).ple_embedding
     model.decoder.layers[1].ple.ple_embedding = embedding
 
     prefix = "model.language_model.layers.1.ple.ple_embedding"

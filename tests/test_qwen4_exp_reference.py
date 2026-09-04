@@ -9,14 +9,10 @@ torch = pytest.importorskip("torch")
 from slime_plugins.models.qwen4_exp.config import Qwen4ExpP0Config
 from slime_plugins.models.qwen4_exp.reference import (
     Qwen4ExpGatedResidual,
-    Qwen4ExpNGramLayout,
     Qwen4ExpPLE,
     Qwen4ExpPackedLayout,
-    Qwen4ExpSparseAttentionReference,
-    build_ngram_ids,
-    build_rope_cos_sin,
+    Qwen4ExpQSA,
     inject_residual,
-    qsa_select_token_indices,
 )
 
 
@@ -72,68 +68,20 @@ def test_packed_layout_resets_positions():
     layout = Qwen4ExpPackedLayout.from_cu_seqlens(7, torch.tensor([0, 3, 7], dtype=torch.int32))
 
     assert layout.positions.tolist() == [0, 1, 2, 0, 1, 2, 3]
-    assert layout.sequence_ids.tolist() == [0, 0, 0, 1, 1, 1, 1]
     assert layout.max_seqlen == 4
 
 
 @pytest.mark.unit
-def test_ngram_hash_has_no_cross_sample_history():
-    config = tiny_config()
-    ngram_layout = Qwen4ExpNGramLayout.from_config(config)
-    tokens = torch.tensor([4, 5, 6, 20, 21, 22])
-    packed = Qwen4ExpPackedLayout.from_cu_seqlens(6, torch.tensor([0, 3, 6]))
-    left = Qwen4ExpPackedLayout.from_cu_seqlens(3, torch.tensor([0, 3]))
-    right = Qwen4ExpPackedLayout.from_cu_seqlens(3, torch.tensor([0, 3]))
-
-    packed_ids = build_ngram_ids(
-        tokens,
-        packed,
-        ngram_layout,
-        config.ngram_size,
-        config.heads_per_ngram,
-        config.eos_token_id,
-    )
-    separate_ids = torch.cat(
-        [
-            build_ngram_ids(
-                segment,
-                layout,
-                ngram_layout,
-                config.ngram_size,
-                config.heads_per_ngram,
-                config.eos_token_id,
-            )
-            for segment, layout in ((tokens[:3], left), (tokens[3:], right))
-        ]
-    )
-
-    torch.testing.assert_close(packed_ids, separate_ids)
-
-
-@pytest.mark.unit
 def test_ngram_hash_resets_history_after_eos_inside_a_sample():
+    torch.manual_seed(5)
     config = tiny_config()
-    ngram_layout = Qwen4ExpNGramLayout.from_config(config)
+    module = Qwen4ExpPLE(config).ple_embedding
     tokens = torch.tensor([4, 5, config.eos_token_id, 20, 21, 22])
     packed = Qwen4ExpPackedLayout.from_cu_seqlens(6, torch.tensor([0, 6]))
 
-    actual = build_ngram_ids(
-        tokens,
-        packed,
-        ngram_layout,
-        config.ngram_size,
-        config.heads_per_ngram,
-        config.eos_token_id,
-    )
+    actual = module(tokens, packed)
     right = Qwen4ExpPackedLayout.from_cu_seqlens(3, torch.tensor([0, 3]))
-    expected_right = build_ngram_ids(
-        tokens[3:],
-        right,
-        ngram_layout,
-        config.ngram_size,
-        config.heads_per_ngram,
-        config.eos_token_id,
-    )
+    expected_right = module(tokens[3:], right)
 
     torch.testing.assert_close(actual[3:], expected_right)
 
@@ -183,52 +131,28 @@ def test_ple_packed_output_matches_per_sample_execution():
 
 
 @pytest.mark.unit
-def test_qsa_selection_stays_causal_and_inside_each_packed_sample():
+def test_qsa_rejects_sequences_outside_the_p0_budget():
     config = tiny_config()
-    layout = Qwen4ExpPackedLayout.from_cu_seqlens(12, torch.tensor([0, 6, 12]))
-    query = torch.randn(12, config.indexer_n_heads, config.indexer_head_dim)
-    raw_keys = torch.randn(12, config.indexer_head_dim)
-    cos, sin = build_rope_cos_sin(
-        layout.positions,
-        int(config.head_dim * config.partial_rotary_factor),
-        config.rope_theta,
-        query.dtype,
-    )
-    selected = qsa_select_token_indices(
-        query,
-        raw_keys,
-        layout,
-        torch.zeros(config.indexer_head_dim),
-        config.rms_norm_eps,
-        cos,
-        sin,
-        config.indexer_budget,
-        config.indexer_compress_ratio,
-    )
+    module = Qwen4ExpQSA(config)
+    hidden = torch.randn(5, 1, config.hidden_size)
+    layout = Qwen4ExpPackedLayout.from_cu_seqlens(5, torch.tensor([0, 5]))
 
-    for query_idx, indices in enumerate(selected):
-        valid = indices[indices >= 0]
-        sample_start = 0 if query_idx < 6 else 6
-        assert bool(torch.all(valid >= sample_start))
-        assert bool(torch.all(valid <= query_idx))
-        visible_count = query_idx - sample_start + 1
-        if visible_count % config.indexer_compress_ratio:
-            assert query_idx in valid.tolist()
+    with pytest.raises(ValueError, match="4-token QSA budget"):
+        module(hidden, layout)
 
 
 @pytest.mark.unit
-def test_qsa_reference_freezes_indexer_and_backpropagates_lm_path():
+def test_qsa_freezes_indexer_and_backpropagates_lm_path():
     torch.manual_seed(7)
-    config = replace(tiny_config(), indexer_budget=4, indexer_compress_ratio=2)
-    module = Qwen4ExpSparseAttentionReference(config)
+    config = replace(tiny_config(), indexer_budget=8, indexer_compress_ratio=2)
+    module = Qwen4ExpQSA(config)
     hidden = torch.randn(6, 1, config.hidden_size, requires_grad=True)
     layout = Qwen4ExpPackedLayout.from_cu_seqlens(6, torch.tensor([0, 6]))
 
-    output, selected = module(hidden, layout)
+    output = module(hidden, layout)
     output.square().mean().backward()
 
     assert output.shape == hidden.shape
-    assert selected.shape == (6, 5)
     assert all(parameter.grad is None for parameter in module.indexer.parameters())
     assert module.q_proj.weight.grad is not None
     assert module.k_proj.weight.grad is not None
@@ -240,27 +164,19 @@ def test_qsa_reference_freezes_indexer_and_backpropagates_lm_path():
 def test_qsa_full_budget_path_matches_separate_packed_samples():
     torch.manual_seed(17)
     config = replace(tiny_config(), indexer_budget=8, indexer_compress_ratio=2)
-    module = Qwen4ExpSparseAttentionReference(config)
+    module = Qwen4ExpQSA(config)
     hidden = torch.randn(6, 1, config.hidden_size, requires_grad=True)
     packed = Qwen4ExpPackedLayout.from_cu_seqlens(6, torch.tensor([0, 3, 6]))
 
-    packed_output, selected = module(hidden, packed)
+    packed_output = module(hidden, packed)
     separate_output = torch.cat(
         [
             module(
                 hidden[start:end],
                 Qwen4ExpPackedLayout.from_cu_seqlens(end - start, torch.tensor([0, end - start])),
-            )[0]
+            )
             for start, end in ((0, 3), (3, 6))
         ]
     )
 
     torch.testing.assert_close(packed_output, separate_output)
-    assert selected.tolist() == [
-        [0, -1, -1],
-        [0, 1, -1],
-        [0, 1, 2],
-        [3, -1, -1],
-        [3, 4, -1],
-        [3, 4, 5],
-    ]

@@ -27,7 +27,7 @@ def test_qwen4_exp_config_loads_without_transformers_native_model(tmp_path):
         encoding="utf-8",
     )
 
-    assert ensure_hf_auto_classes(tmp_path)
+    ensure_hf_auto_classes(tmp_path)
     config = load_hf_config(tmp_path)
 
     assert type(config).__name__ == "Qwen4ExpConfig"
@@ -45,7 +45,7 @@ def test_unrelated_config_keeps_transformers_default_loader(tmp_path):
         encoding="utf-8",
     )
 
-    assert not ensure_hf_auto_classes(tmp_path)
+    ensure_hf_auto_classes(tmp_path)
     config = load_hf_config(tmp_path)
 
     assert config.model_type == "llama"

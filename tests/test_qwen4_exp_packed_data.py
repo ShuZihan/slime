@@ -48,7 +48,6 @@ def test_qwen4_exp_batch_preserves_boundaries_positions_mask_and_pad_token(monke
     )
     assert layout.boundaries == (0, 3, 5, 6)
     assert layout.positions.tolist() == [0, 1, 2, 0, 1, 0]
-    assert layout.sequence_ids.tolist() == [0, 0, 0, 1, 1, 2]
 
 
 @pytest.mark.unit

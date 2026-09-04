@@ -7,7 +7,7 @@ import json
 from collections import Counter
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Dict, Iterable, List, Mapping, Optional
+from typing import Iterable, Mapping
 
 from .config import Qwen4ExpP0Config
 
@@ -28,18 +28,6 @@ class ParameterLifecycleRecord:
     lifecycle: ParameterLifecycle
     reason: str
 
-    @property
-    def included_in_training_graph(self) -> bool:
-        return self.lifecycle is not ParameterLifecycle.DISABLED
-
-    @property
-    def included_in_optimizer(self) -> bool:
-        return self.lifecycle is ParameterLifecycle.TRAINABLE_SYNC
-
-    @property
-    def included_in_online_update(self) -> bool:
-        return self.lifecycle is ParameterLifecycle.TRAINABLE_SYNC
-
 
 _PLE_BUFFER_SUFFIXES = (
     ".ple.ple_embedding.layer_multipliers",
@@ -48,7 +36,7 @@ _PLE_BUFFER_SUFFIXES = (
 )
 
 
-def classify_qwen4_exp_parameter(source_name: str, source_file: str = "") -> ParameterLifecycleRecord:
+def _classify_parameter(source_name: str, source_file: str) -> ParameterLifecycleRecord:
     if source_name.startswith("model.visual."):
         return ParameterLifecycleRecord(
             source_name, source_file, ParameterLifecycle.DISABLED, "vision tower is outside the P0 text graph"
@@ -90,16 +78,16 @@ def classify_qwen4_exp_parameter(source_name: str, source_file: str = "") -> Par
 
 def build_lifecycle_manifest(
     weight_map: Mapping[str, str],
-    config: Optional[Qwen4ExpP0Config] = None,
-) -> List[ParameterLifecycleRecord]:
-    records = [classify_qwen4_exp_parameter(name, weight_map[name]) for name in sorted(weight_map)]
+    config: Qwen4ExpP0Config | None = None,
+) -> list[ParameterLifecycleRecord]:
+    records = [_classify_parameter(name, weight_map[name]) for name in sorted(weight_map)]
     _validate_manifest(records, config)
     return records
 
 
 def _validate_manifest(
     records: Iterable[ParameterLifecycleRecord],
-    config: Optional[Qwen4ExpP0Config],
+    config: Qwen4ExpP0Config | None,
 ) -> None:
     records = list(records)
     counts = Counter(record.lifecycle for record in records)
@@ -132,13 +120,9 @@ def _validate_manifest(
         )
 
 
-def lifecycle_summary(records: Iterable[ParameterLifecycleRecord]) -> Dict[str, int]:
+def lifecycle_summary(records: Iterable[ParameterLifecycleRecord]) -> dict[str, int]:
     counts = Counter(record.lifecycle.value for record in records)
     return {lifecycle.value: counts[lifecycle.value] for lifecycle in ParameterLifecycle}
-
-
-def online_update_source_names(records: Iterable[ParameterLifecycleRecord]) -> List[str]:
-    return [record.source_name for record in records if record.included_in_online_update]
 
 
 def is_qwen4_exp_model_name(model_name: str) -> bool:

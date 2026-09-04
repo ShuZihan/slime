@@ -20,6 +20,7 @@ MODEL_ARGS=(
   --num-layers 48
   --hidden-size 2560
   --ffn-hidden-size 640
+  --seq-length 256
 
   --normalization RMSNorm
   --apply-layernorm-1p

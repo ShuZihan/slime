@@ -167,14 +167,12 @@ MISC_ARGS=(
 RUNTIME_ENV_JSON="$({
   SLIME_RUNTIME_ROOT="${REPO_ROOT}" \
   QWEN4_EXP_MEGATRON_ROOT="${MEGATRON_ROOT}" \
-  QWEN4_EXP_EVIDENCE_ROOT="${QWEN4_EXP_VALIDATION_DIR}" \
   python3 - <<'PY'
 import json
 import os
 
 repo = os.environ["SLIME_RUNTIME_ROOT"]
 megatron = os.environ["QWEN4_EXP_MEGATRON_ROOT"]
-evidence = os.environ["QWEN4_EXP_EVIDENCE_ROOT"]
 path = ":".join(item for item in (repo, megatron, os.environ.get("PYTHONPATH")) if item)
 env = {
     "PYTHONPATH": path,
@@ -185,7 +183,6 @@ env = {
     "NCCL_NVLS_ENABLE": "0",
     "NVSHMEM_DISABLE_NCCL": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
-    "SLIME_QWEN4_EXP_VALIDATION_DIR": evidence,
 }
 for name in ("MASTER_ADDR", "NO_PROXY", "no_proxy", "NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME"):
     if os.environ.get(name):

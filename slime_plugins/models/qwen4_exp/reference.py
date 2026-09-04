@@ -1,20 +1,14 @@
-"""Executable reference semantics for Qwen4-Exp training.
-
-The kernels in this module favor inspectable behavior over throughput.  They
-are used by CPU/tiny-model tests and as the correctness oracle for optimized
-Megatron operators.
-"""
+"""Executable tensor semantics for the Qwen4-Exp P0 training graph."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 from .config import Qwen4ExpP0Config
 
@@ -25,9 +19,8 @@ class Qwen4ExpPackedLayout:
 
     cu_seqlens: torch.Tensor
     positions: torch.Tensor
-    sequence_ids: torch.Tensor
     max_seqlen: int
-    boundaries: Tuple[int, ...]
+    boundaries: tuple[int, ...]
 
     @classmethod
     def from_cu_seqlens(cls, total_tokens: int, cu_seqlens: torch.Tensor) -> "Qwen4ExpPackedLayout":
@@ -40,24 +33,20 @@ class Qwen4ExpPackedLayout:
         if bool(torch.any(lengths <= 0).item()):
             raise ValueError("packed samples must have positive lengths")
 
-        sequence_ids = torch.repeat_interleave(
-            torch.arange(lengths.numel(), device=cu_seqlens.device, dtype=torch.long), lengths
-        )
         starts = torch.repeat_interleave(cu_seqlens[:-1], lengths)
         positions = torch.arange(total_tokens, device=cu_seqlens.device, dtype=torch.long) - starts
         return cls(
             cu_seqlens=cu_seqlens,
             positions=positions,
-            sequence_ids=sequence_ids,
             max_seqlen=int(lengths.max().item()),
             boundaries=tuple(int(value) for value in cu_seqlens.detach().cpu().tolist()),
         )
 
-    def slices(self) -> List[Tuple[int, int]]:
-        return list(zip(self.boundaries[:-1], self.boundaries[1:]))
+    def slices(self):
+        return zip(self.boundaries[:-1], self.boundaries[1:])
 
 
-def grouped_rms_norm(
+def _grouped_rms_norm(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
     group_size: int,
@@ -76,7 +65,7 @@ def grouped_rms_norm(
     return (normalized * (1.0 + weight.float())).to(original_dtype)
 
 
-class Qwen4ExpGroupedRMSNorm(nn.Module):
+class _Qwen4ExpGroupedRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, group_size: int, eps: float):
         super().__init__()
         if hidden_size % group_size:
@@ -86,7 +75,7 @@ class Qwen4ExpGroupedRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return grouped_rms_norm(hidden_states, self.weight, self.group_size, self.eps)
+        return _grouped_rms_norm(hidden_states, self.weight, self.group_size, self.eps)
 
 
 class Qwen4ExpGatedResidual(nn.Module):
@@ -97,7 +86,7 @@ class Qwen4ExpGatedResidual(nn.Module):
         self.hc_count = config.hyper_connection_count
         self.hidden_size = config.hidden_size
         hc_hidden_size = config.hyper_connection_width
-        self.hc_norm = Qwen4ExpGroupedRMSNorm(hc_hidden_size, config.hidden_size, config.rms_norm_eps)
+        self.hc_norm = _Qwen4ExpGroupedRMSNorm(hc_hidden_size, config.hidden_size, config.rms_norm_eps)
         self.input_mix_weight_down = nn.Linear(hc_hidden_size, config.hc_lowrank, bias=False)
         self.input_mix_weight_up = nn.Linear(config.hc_lowrank, hc_hidden_size, bias=False)
         self.block_inject_weight = nn.Linear(hc_hidden_size, self.hc_count, bias=False) if use_combine else None
@@ -139,14 +128,14 @@ _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
 
 
-def splitmix64(value: int) -> int:
+def _splitmix64(value: int) -> int:
     value = (value + _SPLITMIX_GAMMA) & _MASK64
     value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
     value = ((value ^ (value >> 27)) * _SPLITMIX_M2) & _MASK64
     return (value ^ (value >> 31)) & _MASK64
 
 
-def build_layer_multipliers(
+def _build_layer_multipliers(
     unigram_vocab_size: int,
     ngram_size: int,
     ple_layer_index: int,
@@ -159,7 +148,7 @@ def build_layer_multipliers(
     multipliers = []
     for index in range(ngram_size):
         value = (base_seed + _SPLITMIX_GAMMA * (index + 1)) & _MASK64
-        multipliers.append(2 * (splitmix64(value) % half_bound) + 1)
+        multipliers.append(2 * (_splitmix64(value) % half_bound) + 1)
     return torch.tensor(multipliers, dtype=torch.long)
 
 
@@ -174,7 +163,7 @@ def _is_prime(value: int) -> bool:
     return True
 
 
-def find_nth_prime_after(start: int, count: int) -> int:
+def _find_nth_prime_after(start: int, count: int) -> int:
     prime = start
     for _ in range(count):
         prime += 1
@@ -197,14 +186,14 @@ class Qwen4ExpNGramLayout:
         total = 0
         for head_idx in range(config.ple_num_heads):
             global_head_idx = ple_layer_index * config.ple_num_heads + head_idx
-            size = find_nth_prime_after(config.ngram_vocab_size_base - 1, global_head_idx + 1)
+            size = _find_nth_prime_after(config.ngram_vocab_size_base - 1, global_head_idx + 1)
             sizes.append(size)
             offsets.append(total)
             total += size
         divisor = config.make_ngram_vocab_size_divisible_by
         padded_vocab_size = math.ceil(total / divisor) * divisor
         return cls(
-            multipliers=build_layer_multipliers(
+            multipliers=_build_layer_multipliers(
                 config.vocab_size, config.ngram_size, ple_layer_index, config.seed
             ),
             head_vocab_sizes=torch.tensor(sizes, dtype=torch.long),
@@ -213,7 +202,7 @@ class Qwen4ExpNGramLayout:
         )
 
 
-def build_ngram_ids(
+def _build_ngram_ids(
     input_ids: torch.Tensor,
     packed_layout: Qwen4ExpPackedLayout,
     ngram_layout: Qwen4ExpNGramLayout,
@@ -259,14 +248,14 @@ def build_ngram_ids(
     return torch.cat(blocks, dim=-1)
 
 
-class Qwen4ExpNGramEmbedding(nn.Module):
+class _Qwen4ExpNGramEmbedding(nn.Module):
     """Small/reference PLE table with checkpoint-compatible buffer names."""
 
     def __init__(
         self,
         config: Qwen4ExpP0Config,
         ple_layer_index: int = 0,
-        embedding_factory: Optional[Callable[[int, int], nn.Module]] = None,
+        embedding_factory: Callable[[int, int], nn.Module] | None = None,
     ):
         super().__init__()
         self.config = config
@@ -290,7 +279,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             head_offsets=self.ngram_heads_offsets,
             padded_vocab_size=self.layout.padded_vocab_size,
         )
-        ngram_ids = build_ngram_ids(
+        ngram_ids = _build_ngram_ids(
             input_ids,
             packed_layout,
             runtime_layout,
@@ -308,20 +297,20 @@ class Qwen4ExpPLE(nn.Module):
         self,
         config: Qwen4ExpP0Config,
         ple_layer_index: int = 0,
-        embedding_factory: Optional[Callable[[int, int], nn.Module]] = None,
+        embedding_factory: Callable[[int, int], nn.Module] | None = None,
     ):
         super().__init__()
         self.config = config
-        self.ple_embedding = Qwen4ExpNGramEmbedding(config, ple_layer_index, embedding_factory)
+        self.ple_embedding = _Qwen4ExpNGramEmbedding(config, ple_layer_index, embedding_factory)
         self.key_proj = nn.Linear(config.ple_embed_dim, config.hyper_connection_width, bias=False)
         self.value_proj = nn.Linear(config.ple_embed_dim, config.hidden_size, bias=False)
-        self.norm_key = Qwen4ExpGroupedRMSNorm(
+        self.norm_key = _Qwen4ExpGroupedRMSNorm(
             config.hyper_connection_width, config.hidden_size, config.rms_norm_eps
         )
-        self.norm_query = Qwen4ExpGroupedRMSNorm(
+        self.norm_query = _Qwen4ExpGroupedRMSNorm(
             config.hyper_connection_width, config.hidden_size, config.rms_norm_eps
         )
-        self.norm_conv = Qwen4ExpGroupedRMSNorm(
+        self.norm_conv = _Qwen4ExpGroupedRMSNorm(
             config.hyper_connection_width, config.hidden_size, config.rms_norm_eps
         )
         self.conv1d = nn.Conv1d(
@@ -376,12 +365,12 @@ class Qwen4ExpPLE(nn.Module):
         return output.unsqueeze(1) if hidden_states.ndim == 3 else output
 
 
-def build_rope_cos_sin(
+def _build_rope_cos_sin(
     positions: torch.Tensor,
     rotary_dim: int,
     rope_theta: float,
     dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     inv_freq = 1.0 / (
         rope_theta
         ** (torch.arange(0, rotary_dim, 2, device=positions.device, dtype=torch.float32) / rotary_dim)
@@ -396,7 +385,7 @@ def _rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
     return torch.cat((-second, first), dim=-1)
 
 
-def apply_partial_rope(
+def _apply_partial_rope(
     hidden_states: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
@@ -409,178 +398,21 @@ def apply_partial_rope(
     return torch.cat((rotated, passthrough), dim=-1)
 
 
-def qsa_select_token_indices(
-    index_query: torch.Tensor,
-    raw_index_keys: torch.Tensor,
-    packed_layout: Qwen4ExpPackedLayout,
-    key_norm_weight: torch.Tensor,
-    norm_eps: float,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    token_budget: int,
-    compress_ratio: int,
-) -> torch.Tensor:
-    """Return global packed-token indices selected by the QSA indexer."""
+class _Qwen4ExpQSAIndexer(nn.Module):
+    """Frozen checkpoint state retained for SGLang parity during P0."""
 
-    if index_query.ndim != 3 or raw_index_keys.ndim != 2:
-        raise ValueError("index query/key shapes must be [S, heads, D] and [S, D]")
-    capacity = min(token_budget + compress_ratio - 1, packed_layout.max_seqlen)
-    selected = torch.full(
-        (index_query.shape[0], capacity), -1, dtype=torch.int32, device=index_query.device
-    )
-    block_topk = token_budget // compress_ratio
-    head_dim = index_query.shape[-1]
-
-    for start, end in packed_layout.slices():
-        segment_keys = raw_index_keys[start:end]
-        for local_query_idx in range(end - start):
-            visible_count = local_query_idx + 1
-            num_complete_blocks = visible_count // compress_ratio
-            if num_complete_blocks:
-                block_tokens = torch.arange(
-                    num_complete_blocks * compress_ratio,
-                    device=index_query.device,
-                    dtype=torch.long,
-                ).view(num_complete_blocks, compress_ratio)
-                pooled = segment_keys.index_select(0, block_tokens.flatten()).view(
-                    num_complete_blocks, compress_ratio, head_dim
-                )
-                pooled = pooled.float().mean(dim=1).to(segment_keys.dtype)
-                pooled = grouped_rms_norm(pooled, key_norm_weight, head_dim, norm_eps)
-                group_starts = start + block_tokens[:, 0]
-                pooled = apply_partial_rope(pooled.unsqueeze(1), cos[group_starts], sin[group_starts]).squeeze(1)
-                scores = torch.matmul(
-                    index_query[start + local_query_idx].float(), pooled.float().transpose(-1, -2)
-                ).transpose(-1, -2)
-                scores = torch.relu(scores).sum(dim=-1) / math.sqrt(head_dim)
-                chosen_blocks = scores.topk(min(block_topk, num_complete_blocks), dim=0).indices
-                chosen = block_tokens.index_select(0, chosen_blocks).flatten() + start
-            else:
-                chosen = torch.empty(0, device=index_query.device, dtype=torch.long)
-            tail_start = num_complete_blocks * compress_ratio
-            tail = torch.arange(start + tail_start, start + visible_count, device=index_query.device)
-            chosen = torch.cat((chosen, tail)).to(torch.int32)
-            selected[start + local_query_idx, : chosen.numel()] = chosen
-    return selected
-
-
-class Qwen4ExpQSAIndexer(nn.Module):
     def __init__(self, config: Qwen4ExpP0Config):
         super().__init__()
-        self.config = config
         projection_size = (config.indexer_n_heads + config.indexer_kv_heads) * config.indexer_head_dim
         self.index_qk_proj = nn.Linear(config.hidden_size, projection_size, bias=False)
-        self.q_layernorm = Qwen4ExpGroupedRMSNorm(
+        self.q_layernorm = _Qwen4ExpGroupedRMSNorm(
             config.indexer_head_dim, config.indexer_head_dim, config.rms_norm_eps
         )
-        self.k_layernorm = Qwen4ExpGroupedRMSNorm(
+        self.k_layernorm = _Qwen4ExpGroupedRMSNorm(
             config.indexer_head_dim, config.indexer_head_dim, config.rms_norm_eps
         )
         for parameter in self.parameters():
             parameter.requires_grad_(False)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        packed_layout: Qwen4ExpPackedLayout,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        flat_hidden = hidden_states[:, 0] if hidden_states.ndim == 3 else hidden_states
-        qk = self.index_qk_proj(flat_hidden)
-        query_width = self.config.indexer_n_heads * self.config.indexer_head_dim
-        query, raw_keys = torch.split(qk, [query_width, self.config.indexer_head_dim], dim=-1)
-        query = query.unflatten(-1, (self.config.indexer_n_heads, self.config.indexer_head_dim))
-        query = self.q_layernorm(query)
-        query = apply_partial_rope(query, cos, sin)
-        return qsa_select_token_indices(
-            query,
-            raw_keys,
-            packed_layout,
-            self.k_layernorm.weight,
-            self.config.rms_norm_eps,
-            cos,
-            sin,
-            self.config.indexer_budget,
-            self.config.indexer_compress_ratio,
-        )
-
-
-def qsa_sparse_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    selected_indices: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    query_chunk_size: int = 8,
-) -> torch.Tensor:
-    """Differentiable QSA oracle with bounded temporary activation memory.
-
-    A query chunk materializes at most ``query_chunk_size * token_budget``
-    selected KV rows. CUDA training recomputes each chunk in backward, keeping
-    gathered KV tensors out of the saved activation set for every QSA layer.
-    """
-
-    if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
-        raise ValueError("query, key, and value must have shape [S, heads, D]")
-    if key.shape[1] != value.shape[1] or query.shape[1] % key.shape[1]:
-        raise ValueError("QSA requires a valid grouped-query head ratio")
-    if query_chunk_size <= 0:
-        raise ValueError("query_chunk_size must be positive")
-    repeats = query.shape[1] // key.shape[1]
-    scale = softmax_scale if softmax_scale is not None else query.shape[-1] ** -0.5
-    head_to_kv = torch.div(
-        torch.arange(query.shape[1], device=query.device), repeats, rounding_mode="floor"
-    )
-
-    def attend_chunk(
-        query_chunk: torch.Tensor,
-        full_key: torch.Tensor,
-        full_value: torch.Tensor,
-        index_chunk: torch.Tensor,
-    ) -> torch.Tensor:
-        valid = index_chunk >= 0
-        if bool(torch.any(~valid.any(dim=-1)).item()):
-            raise ValueError("every QSA query must select at least one key token")
-        safe_indices = index_chunk.clamp_min(0).long()
-        selected_key = full_key[safe_indices][:, :, head_to_kv, :]
-        selected_value = full_value[safe_indices][:, :, head_to_kv, :]
-        scores = torch.einsum("chd,ckhd->chk", query_chunk.float(), selected_key.float()) * scale
-        scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
-        probabilities = torch.softmax(scores, dim=-1).to(full_value.dtype)
-        return torch.einsum("chk,ckhd->chd", probabilities, selected_value)
-
-    outputs = []
-    use_checkpoint = query.is_cuda and torch.is_grad_enabled() and any(
-        tensor.requires_grad for tensor in (query, key, value)
-    )
-    for start in range(0, query.shape[0], query_chunk_size):
-        end = min(start + query_chunk_size, query.shape[0])
-        chunk_args = (query[start:end], key, value, selected_indices[start:end])
-        if use_checkpoint:
-            outputs.append(checkpoint(attend_chunk, *chunk_args, use_reentrant=False))
-        else:
-            outputs.append(attend_chunk(*chunk_args))
-    return torch.cat(outputs, dim=0)
-
-
-def _all_visible_token_indices(packed_layout: Qwen4ExpPackedLayout) -> torch.Tensor:
-    """Materialize the causal selection set when the QSA budget covers every key."""
-
-    total_tokens = packed_layout.positions.numel()
-    selected = torch.full(
-        (total_tokens, packed_layout.max_seqlen),
-        -1,
-        dtype=torch.int32,
-        device=packed_layout.positions.device,
-    )
-    for start, end in packed_layout.slices():
-        length = end - start
-        local = torch.arange(length, device=selected.device, dtype=torch.int32)
-        causal = local.unsqueeze(0).expand(length, -1) + start
-        visible = local.unsqueeze(0) <= local.unsqueeze(1)
-        selected[start:end, :length] = torch.where(visible, causal, -1)
-    return selected
 
 
 def _packed_dense_attention(
@@ -609,8 +441,8 @@ def _packed_dense_attention(
     return torch.cat(outputs, dim=0)
 
 
-class Qwen4ExpSparseAttentionReference(nn.Module):
-    """Checkpoint-shaped QSA layer used for parity and gradient tests."""
+class Qwen4ExpQSA(nn.Module):
+    """Full-selection QSA training path for the P0 context-length contract."""
 
     def __init__(self, config: Qwen4ExpP0Config):
         super().__init__()
@@ -619,18 +451,23 @@ class Qwen4ExpSparseAttentionReference(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * config.head_dim, bias=False)
         self.o_proj = nn.Linear(config.num_attention_heads * config.head_dim, config.hidden_size, bias=False)
-        self.q_norm = Qwen4ExpGroupedRMSNorm(config.head_dim, config.head_dim, config.rms_norm_eps)
-        self.k_norm = Qwen4ExpGroupedRMSNorm(config.head_dim, config.head_dim, config.rms_norm_eps)
-        self.indexer = Qwen4ExpQSAIndexer(config)
+        self.q_norm = _Qwen4ExpGroupedRMSNorm(config.head_dim, config.head_dim, config.rms_norm_eps)
+        self.k_norm = _Qwen4ExpGroupedRMSNorm(config.head_dim, config.head_dim, config.rms_norm_eps)
+        self.indexer = _Qwen4ExpQSAIndexer(config)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         packed_layout: Qwen4ExpPackedLayout,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
+        if packed_layout.max_seqlen > self.config.indexer_budget:
+            raise ValueError(
+                "Qwen4-Exp P0 requires every packed sequence to fit within "
+                f"the {self.config.indexer_budget}-token QSA budget"
+            )
         flat_hidden = hidden_states[:, 0] if hidden_states.ndim == 3 else hidden_states
         rotary_dim = int(self.config.head_dim * self.config.partial_rotary_factor)
-        cos, sin = build_rope_cos_sin(
+        cos, sin = _build_rope_cos_sin(
             packed_layout.positions.to(flat_hidden.device), rotary_dim, self.config.rope_theta, flat_hidden.dtype
         )
 
@@ -640,19 +477,11 @@ class Qwen4ExpSparseAttentionReference(nn.Module):
         query, gate = projected_query.chunk(2, dim=-1)
         key = self.k_proj(flat_hidden).unflatten(-1, (self.config.num_key_value_heads, self.config.head_dim))
         value = self.v_proj(flat_hidden).unflatten(-1, (self.config.num_key_value_heads, self.config.head_dim))
-        query = apply_partial_rope(self.q_norm(query), cos, sin)
-        key = apply_partial_rope(self.k_norm(key), cos, sin)
-        if packed_layout.max_seqlen <= self.config.indexer_budget:
-            # QSA selects the full causal prefix in this regime.  P0 keeps its
-            # validation context below the public 2048-token budget, allowing
-            # the fused dense kernel to execute the same mathematical graph.
-            selected_indices = _all_visible_token_indices(packed_layout)
-            attention_output = _packed_dense_attention(query, key, value, packed_layout)
-        else:
-            selected_indices = self.indexer(flat_hidden, packed_layout, cos, sin)
-            attention_output = qsa_sparse_attention(query, key, value, selected_indices)
+        query = _apply_partial_rope(self.q_norm(query), cos, sin)
+        key = _apply_partial_rope(self.k_norm(key), cos, sin)
+        attention_output = _packed_dense_attention(query, key, value, packed_layout)
         attention_output = attention_output * torch.sigmoid(gate)
         output = self.o_proj(attention_output.flatten(-2))
         if hidden_states.ndim == 3:
             output = output.unsqueeze(1)
-        return output, selected_indices
+        return output

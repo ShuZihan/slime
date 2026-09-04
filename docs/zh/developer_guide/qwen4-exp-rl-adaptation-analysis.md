@@ -98,14 +98,9 @@ Attention 和 MoE 各拥有一套 `Qwen4ExpGatedResidual`。Read path 对 `4H` �
 
 ### QSA
 
-QSA 将历史 key 每 4 tokens 压缩成一个 block key，Indexer 为每个 query 计算 block score，选择最多 512 blocks，并保留尚未形成完整 block 的 causal tail。被选 token 上的 Q/K/V/O 路径参与 autograd。Top-K index 是离散选择，LM loss 没有通往 Indexer score 的梯度路径，因此 P0 冻结 Indexer 的三组 checkpoint 参数。
+QSA 将历史 key 每 4 tokens 压缩成一个 block key，公开配置的选择预算为 2048 tokens。P0 的训练序列固定为 256 tokens，因此选择集合覆盖完整 causal prefix，训练侧逐个 packed sample 调用 causal SDPA。Q/K/V/O 路径参与 autograd；Indexer 三组 checkpoint 参数保留在模型状态中并冻结，用于维持 Megatron 与 SGLang 的启动权重一致性。
 
-训练实现包含两条路径：
-
-- `max_seqlen ≤ 2048`：Indexer 的选择集合覆盖完整 causal prefix，使用 PyTorch causal SDPA 计算同一 full-selection 结果。P0 验证上下文 256 走此路径；
-- `max_seqlen > 2048`：参考路径逐样本建立压缩 block、Top-K 与 causal tail，再以 query chunk 执行稀疏 attention；CUDA backward 对 chunk 重计算，控制保存的 selected-KV activation。
-
-第二条路径提供正确性 oracle，吞吐优化归入 P1。生产规模长上下文需要 packed-varlen QSA forward/backward kernel、activation recompute 与分布式选块实现。
+训练实现只接受 `max_seqlen ≤ 2048`。模型 provider 同时约束 `seq_length`，运行时再次检查每个 packed sample。超出预算的输入立即返回明确错误。本分支不携带长上下文 Top-K oracle、selected-index 输出和 query-chunk recompute 路径。
 
 ### PLE
 
@@ -124,17 +119,13 @@ P0 冻结 table，projection、norm 与 convolution 继续训练。SGLang 启用
 [`slime/backends/megatron_utils/data.py`](../../../slime/backends/megatron_utils/data.py) 把多个样本拼成单行 token stream，并建立 `cu_seqlens`。Qwen4-Exp 模型据此生成：
 
 - 每个样本从 0 开始的 `positions`；
-- 每个 token 的 `sequence_id`；
+- 可直接遍历的样本起止位置；
 - PLE n-gram 与 convolution 的重置边界；
 - QSA 候选集合与 causal mask 的样本边界。
 
 公开 checkpoint 的 `pad_token_id=null`，训练参数解析时回退到 `eos_token_id=248044`。为满足 TP padding 倍数而添加的尾部 token 作为一个独立 synthetic packed sample 写入 `cu_seqlens`，其 loss mask 全零。PLE 还会在样本内部的 EOS 后重置词法 n-gram history。
 
-P0 以 `CP=1` 保持完整样本局部可见。P1 的 QSA-CP 数据流为：
-
-`local compressed-K → local Top-K → exact global Top-K → owner 拉取 selected K/V → sparse attention/LSE merge`
-
-PLE CP 同时需要跨 rank 的 n-gram/conv 左侧 state；PP 需要传输 `4H` residual tensor。这两项与 QSA-CP 一起进入 P1。
+P0 以 `CP=1` 保持完整样本局部可见，并以 `PP=1` 保持 `4H` residual state 位于同一 pipeline stage。
 
 ## Checkpoint 与参数生命周期
 
@@ -222,28 +213,35 @@ RAY_ADDRESS=auto tools/qwen4_exp/validate.sh \
 
 Transformers↔Megatron 的证据由三层组成：公开 manifest 全量分类、checkpoint load audit 的真实 tensor 对齐、基于固定 Transformers 参考语义的 tiny GR/PLE/QSA forward 与 gradient tests。Megatron↔SGLang 的证据由训练/rollout logprob 阈值、同步前后双方 fingerprint/checksum 与第二轮生成共同给出。
 
-## 组件状态与后续阶段
+## P0 消融实验
 
-| 组件 | P0 状态 | P1/P2 工作 |
-|---|---|---|
-| 运行时基线 | 固定版本、可重建 image、双 overlay | 跟踪 SGLang PR 后续提交并重做 overlay 差异审计 |
-| Megatron 模型 | 完整 text graph、mHC、GDN、QSA、PLE、MoE | QSA/GDN/GR 的 TP-native 计算与 PP `4H` 通信 |
-| QSA 训练 | full-budget fused path + 稀疏正确性 oracle | packed-varlen 高性能 forward/backward、recompute、QSA-CP |
-| PLE | TP 行分片、128 shard 流式加载、table 冻结 | PLE CP state；P2 row-sparse optimizer、owner-sharded update 与 changed-row sync |
-| Checkpoint | 四类 manifest、HF↔Megatron 双向映射 | 量化 checkpoint 与可训练 PLE delta |
-| 在线更新 | trainable-only tensor/distributed sync、static fingerprint | FP8/NVFP4 更新后重校准/重量化 |
-| Packed data | boundary、position、EOS/PAD、loss mask | CP 分布式边界状态 |
-| Tokenizer/Agent | `qwen4_exp` 使用 Qwen3.5 full-rendered offset mask；tool-call 多轮 golden test | 按目标 Agent 数据补充 thinking/preserve-thinking/XML 模板 corpus |
-| Vision/MTP | P0 关闭 | Vision RL、MRoPE、多模态 packing、MTP auxiliary loss 与 speculative rollout |
+对照组为提交 `8ad267e`，处理组只删减 P0 启动参数无法到达、没有生产调用者或形成重复配置来源的实现。checkpoint、prompt、manifest contract 和 SGLang 固定提交保持一致。
 
-性能验收安排在正确性门禁之后。P1 以同一 checkpoint、prompt 集、并发与输出长度比较 TPOT、TTFT、显存和同步时延；QSA kernel、PLE placement 或并行策略的收益均通过同条件端到端 A/B 确认。
+| 指标 | 对照组 | 处理组 |
+|---|---:|---:|
+| Qwen4-Exp 相关顶层 symbol | 101 | 90 |
+| 公开顶层 symbol | 47 | 31 |
+| `reference.py` 行数 | 658 | 487 |
+| 非测试、非文档净代码变化 | 0 | -290 行 |
+| 本地门禁 | 53 项通过 | 54 项通过 |
+| lifecycle manifest digest | `00ae2f76...e56d` | `00ae2f76...e56d` |
+
+删除项及证据：
+
+- 长上下文 QSA Top-K oracle、selected-index 返回值和 chunk checkpoint：P0 的 `seq_length=256`，公开 `indexer_budget=2048`；处理组新增超预算拒绝测试。
+- package re-export、生命周期派生属性、无调用 driver event、`index_block_topk` 测试型属性和单行包装函数：生产调用图中没有使用者。
+- validation-dir 环境变量和 fingerprint-regex 环境变量：CLI 已提供唯一配置来源，fingerprint 集合属于验收 contract。
+- packed `sequence_ids`：模型计算只读取 `cu_seqlens`、`positions`、`max_seqlen` 和样本起止位置。
+- Transformers 旧注册分支：固定的本地版本与容器版本都支持 `exist_ok=True`。
+
+保留项包括 Qwen4-Exp config adapter、参数生命周期 manifest、PLE 流式分片、训练/rollout fingerprint 以及两份 SGLang overlay。删除这些 module 后，配置归一化、静态参数过滤、大表加载或内网证据采集会扩散到多个调用点。
 
 ## 当前验证状态
 
 本地已完成以下证据：
 
 - 两份 SGLang patch 在固定提交上 clean apply；patch 后源码通过 Python 语法检查；1-token 与 valid+padding write-plan CPU 行为检查通过；
-- 53 项 Qwen4-Exp 门禁测试覆盖 config/lifecycle、HF config fallback、GR/GDN/PLE/QSA、checkpoint mapping、完整 Megatron tiny packed graph、数据 padding/mask 与验收器；
+- 54 项 Qwen4-Exp 门禁测试覆盖 config/lifecycle、HF config fallback、GR/GDN/PLE/QSA、checkpoint mapping、完整 Megatron tiny packed graph、数据 padding/mask 与验收器；
 - 完整 Megatron tiny graph 在单进程 Gloo 上完成 forward、loss、backward，并确认 PLE table 无梯度、QSA Indexer 无在线同步项；
 - `git diff --check`、Python compile 与 shell syntax 纳入最终本地检查。
 
