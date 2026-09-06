@@ -231,6 +231,61 @@ bash tools/qwen4_exp/validate.sh \
 
 默认脚本执行两轮，每轮 8 prompts × 2 responses，训练和 rollout 分时复用 GPU。交替 0/1 奖励用于检查更新流程，不能用于判断回答质量。默认脚本没有配置保存，保存和恢复见下方。
 
+## Loss、记录与可视化
+
+**P0 先用 TensorBoard 看每步指标，保留样本用于复查。RL loss 不要求单调下降。** 当前每组人工奖励为 0/1，平均原始 reward 为 0.5；正负 advantage 可能使平均 policy loss 接近 0，但梯度仍然非零。默认两次更新只用于检查流程。
+
+| 现有指标 | 判断重点 |
+| --- | --- |
+| `train/loss`、`train/pg_loss` | 无 NaN/Inf；当前 KL、entropy 系数为 0，两者应一致 |
+| `train/grad_norm` | 有效 advantage 下应有梯度；排查持续为 0 或异常突增 |
+| `train/train_rollout_logprob_abs_diff` | 同权重、同 token 下检查训推差异；`0.1` 只是流程门槛 |
+| `train/pg_clipfrac`、`train/entropy_loss` | 关注大量裁剪、熵突然下降，并结合回答内容判断 |
+| `train/lr-pg_*`、`train/global_batch_size` | 确认实际学习率和每步批大小符合配置 |
+| `rollout/response_len/mean`、`rollout/truncated_ratio`、`rollout/repetition_frac` | 检查生成长度、截断和重复；默认回答上限仅 32 token |
+
+### 开启记录
+
+在第 6 步提交完整模型任务前，将 `scripts/run-qwen4-exp-p0-validation.sh` 复制为同目录下的 `run-qwen4-exp-p0-observe.sh`，在副本中做两处修改：
+
+1. 在 `MISC_ARGS` 数组中加入：
+
+   ```bash
+   --use-tensorboard
+   --save-debug-train-data "${QWEN4_EXP_VALIDATION_DIR}/train_data/{rollout_id}.pt"
+   ```
+
+2. 在构造 `RUNTIME_ENV_JSON` 的 Python `env` 字典中加入，确保 Ray 写入进程收到共享目录：
+
+   ```python
+   "TENSORBOARD_DIR": os.path.join(os.environ["QWEN4_EXP_VALIDATION_DIR"], "tensorboard"),
+   ```
+
+各节点镜像需能执行 `python3 -c 'from torch.utils.tensorboard import SummaryWriter'`。在第 6 步的 `validate.sh` 命令中增加 `--e2e-script /root/slime/scripts/run-qwen4-exp-p0-observe.sh`；它会设置本次 `QWEN4_EXP_VALIDATION_DIR`。原启动脚本不透传尾部参数，不能直接在 `bash scripts/…sh` 后追加训练 flag。
+
+在安装了 TensorBoard、能访问共享目录的机器上查看本次实验：
+
+```bash
+tensorboard --logdir "$Q4_SHARED/evidence/$Q4_RUN_ID/tensorboard" \
+  --host 127.0.0.1 --port 6006
+```
+
+浏览器打开 `http://127.0.0.1:6006`；远程运行时通过 SSH 转发 6006 端口，或将 event 文件复制到本地查看。训练曲线按 optimizer step，rollout 曲线按 rollout 轮次；先看未平滑曲线，避免漏掉尖峰。
+
+- **每次更新：**现有日志记录上表训练指标；loss 来自本次更新使用的 forward，并非更新后的重算结果。
+- **每轮采样：**`rollout_data/{rollout_id}.pt` 已默认开启；新增的 `train_data/{rollout_id}.pt` 保存 token、mask、advantage 和 logprob 等，可用 `rollout_position` 或 `sample_index` 与 rollout 样本关联。
+- **每次实验：**使用独立 run ID，保留源码 commit、本地脚本改动、启动参数、模型/数据版本和随机种子，以及现有 console、`e2e.log`。
+
+### 没有基线时如何验证
+
+1. **计算正确：**从 dump 独立重算 GRPO loss，核对 token 对齐、温度、mask、裁剪区间和归约方式。默认先对每条回答的有效 token 求平均，再对样本求平均。
+2. **更新正确：**固定同一批样本、旧策略 logprob 和 advantage，更新前后分别 forward；小步长下检查策略目标改善，并用 `lr=0` 对照参数不变。看 advantage 加权后的总体变化，不要求每条正奖励回答的概率都上升。
+3. **效果改善：**换成与回答内容相关的奖励，以初始化 checkpoint 在固定独立评测集上的结果为基线，比较训练前后成功率及重复评测波动。
+
+**待补能力：**现有 train dump 没有自动保存每步更新前后两套结果；固定 batch 更新对照、逐 token 误差的 p95/p99/max 和参数更新量需要额外采集。TensorBoard writer 的 `flush/close` 尚未接入完整收尾流程，需补每步 flush 或写入进程退出时的关闭，才能确保短 P0 的尾部记录落盘。曲线缺少末步数据时先核对 `e2e.log`，不能据此认定训练未执行。
+
+工具选择：内网先用 [TensorBoard](https://docs.pytorch.org/docs/stable/tensorboard.html)；多实验协作可用已有 W&B 接口，offline 模式需后续同步到服务查看；已有统一实验平台时再考虑 MLflow。可视化和流程通过均不能代替精度对照。
+
 ## 保存、HF 导出与恢复
 
 原始 checkpoint 约 360 GB，HF 导出与有状态 Adam checkpoint 还会增加大量磁盘、CPU 内存开销。保存时保留可读的原始 `HF_CHECKPOINT`，导出器需要补齐冻结权重。
