@@ -1,5 +1,7 @@
 # slime
 
+**Qwen4-Exp RL:** [Setup and run](tools/qwen4_exp/README.md) using the existing `slime:latest` image.
+
 [中文版](./README_zh.md)
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://thudm.github.io/slime/)

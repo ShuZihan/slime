@@ -1,5 +1,7 @@
 # slime
 
+**Qwen4-Exp RL：**[使用说明](tools/qwen4_exp/README.md)，复用已有 `slime:latest` 镜像。
+
 [English](./README.md)
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://thudm.github.io/slime/)

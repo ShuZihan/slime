@@ -1,6 +1,6 @@
 # Qwen4-Exp 在 slime 中的 RL 适配设计与交付
 
-内网执行入口见 [Qwen4-Exp P0 操作手册](qwen4-exp-intranet-validation-runbook.md)：直接拉取 `qwen4-exp-rl` 分支，复用已有 `slime:latest` 镜像。
+运行入口见 [Qwen4-Exp README](../../../tools/qwen4_exp/README.md)：直接拉取 `qwen4-exp-rl` 分支，复用已有 `slime:latest` 镜像。
 
 > 术语约定：公开 checkpoint 的仓库名为 `Qwen3.8-Flash-Next`，配置字段 `model_type=qwen4_exp`、Transformers 类名和 SGLang 实现均使用 `Qwen4Exp`。本文统一称模型及架构为 **Qwen4-Exp**；公开 checkpoint 路径、外部链接和配置字段保留上游名称。
 
@@ -377,7 +377,7 @@ Transformers↔Megatron 的证据由三层组成：公开 manifest 全量分类�
 
 正确性修复后的基线为 **66 passed、1 skipped**，第二轮结构消融后为 **71 passed、1 skipped**；跳过项是显式启用的四 GPU 测试。CPU 门禁包含 TP 分片与 HF 导出检查。
 
-GitHub 交付前增加了 Megatron namespace package 的版本定位回归，本地检查合计 **72 项通过、1 项跳过**。其中 3 项 Gloo/多进程测试因沙箱限制共享内存和本机通信，改在沙箱外重跑并通过；跳过项仍是未启用的四 GPU 测试。操作手册的 25 段 Bash、10 段 Python 语法和保存/恢复脚本参数检查通过。这些检查不包含真实 checkpoint、多机 GPU 或 RL 质量验收。
+GitHub 交付前增加了 Megatron namespace package 的版本定位回归，本地检查合计 **72 项通过、1 项跳过**。其中 3 项 Gloo/多进程测试因沙箱限制共享内存和本机通信，改在沙箱外重跑并通过；跳过项仍是未启用的四 GPU 测试。当时提交的使用文档已通过 Bash/Python 语法和保存/恢复脚本参数检查，后续入口整理为 README。这些检查不包含真实 checkpoint、多机 GPU 或 RL 质量验收。
 
 - 两份 SGLang patch 在固定提交上 clean apply；patch 后源码通过 Python 语法检查；1-token 与 valid+padding write-plan CPU 行为检查通过；
 - 原有单进程 tiny packed graph 使用了替代 GDN 和 MLP，只证明模型连接、packed metadata 与部分梯度流，不能证明真实 GDN/MoE 或 RL loss 闭环；测试已据此更名；
