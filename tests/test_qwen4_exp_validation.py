@@ -4,9 +4,10 @@ import asyncio
 import copy
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -38,6 +39,66 @@ def _write_jsonl(path, records):
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
         encoding="utf-8",
     )
+
+
+@pytest.mark.unit
+def test_node_preflight_locates_megatron_core_under_a_namespace_package(tmp_path, monkeypatch):
+    # Match upstream's layout: megatron/ has no __init__.py; core/ does.
+    sources = {
+        "megatron/core/__init__.py": "",
+        "sglang/__init__.py": "",
+        "sglang/srt/models/qwen4_exp.py": (
+            '_preserve_on_weight_reset = True\ngetattr(self.config, "seed", None) or 1234'
+        ),
+        "sglang/srt/utils/weight_checker.py": "_preserve_on_weight_reset",
+        "sglang/srt/layers/attention/qsa/metadata.py": "compress_plan_valid",
+        "sglang/srt/layers/attention/qsa/qsa_indexer.py": "metadata.compress_plan_valid[:, None]",
+        "sglang/srt/layers/attention/qwen_sparse_attn_backend.py": "group_plan_valid",
+    }
+    for name, body in sources.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture"],
+        cwd=tmp_path,
+        check=True,
+    )
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp_path, text=True).strip()
+    namespace = ModuleType("megatron")
+    namespace.__file__ = None
+    namespace.__path__ = [str(tmp_path / "megatron")]
+    core = ModuleType("megatron.core")
+    core.__file__ = str(tmp_path / "megatron/core/__init__.py")
+    namespace.core = core
+    monkeypatch.setitem(sys.modules, "megatron", namespace)
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+    for name, path in (
+        ("sglang", tmp_path / "sglang/__init__.py"),
+        ("slime", _VALIDATE.REPO_ROOT / "slime/__init__.py"),
+    ):
+        module = ModuleType(name)
+        module.__file__ = str(path)
+        monkeypatch.setitem(sys.modules, name, module)
+    transformers = ModuleType("transformers")
+    transformers.__version__ = "fixture"
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    (tmp_path / "model.safetensors.index.json").write_text('{"weight_map": {"w": "shard"}}')
+    (tmp_path / "shard").touch()
+    (tmp_path / "marker").touch()
+
+    local = _VALIDATE._module_git_state("megatron.core")
+    remote = _VALIDATE._ray_node_probe(
+        str(tmp_path),
+        str(tmp_path / "marker"),
+        {"sglang": {"commit": commit}, "megatron_commit": commit, "transformers_version": "fixture"},
+        _VALIDATE._critical_source_hashes(_VALIDATE.REPO_ROOT),
+    )
+    assert local["commit"] == remote["megatron_commit"] == commit
+    assert Path(remote["megatron_module"]) == Path(core.__file__)
+    assert not remote["failures"]
 
 
 @pytest.mark.unit

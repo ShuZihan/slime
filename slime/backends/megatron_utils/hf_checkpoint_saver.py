@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from slime.utils import accelerator
+from slime_plugins.models.qwen4_exp.lifecycle import is_qwen4_exp_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,12 @@ def save_hf_model_to_path(
         dist.broadcast_object_list(payload, src=0)
     model_name, quantization_config = payload[0]
 
+    if is_qwen4_exp_model_name(model_name):
+        if quantization_config is not None:
+            raise ValueError("Qwen4-Exp P0 HF export requires unquantized weights")
+        _save_qwen4_exp_hf_weights(args, path, model, model_name, progress_desc)
+        return
+
     hf_weight_iterator = HfWeightIteratorDirect(
         args=args,
         model=model,
@@ -128,6 +135,61 @@ def save_hf_model_to_path(
 
     if is_save_rank:
         logger.info("Successfully saved HuggingFace model to %s", path)
+
+
+def _save_qwen4_exp_hf_weights(args, path, model, model_name, progress_desc):
+    from .qwen4_exp_hf_export import Qwen4ExpHfExport
+    from .update_weight.common import named_params_and_buffers
+    from .update_weight.hf_weight_iterator_direct import HfWeightIteratorDirect
+
+    is_writer = _is_global_rank_zero()
+    exporter = None
+    error = None
+    if is_writer:
+        try:
+            exporter = Qwen4ExpHfExport(args.hf_checkpoint)
+        except Exception as exc:
+            error = repr(exc)
+    _raise_if_rank_zero_failed("read Qwen4-Exp source manifest", error)
+
+    iterator = HfWeightIteratorDirect(
+        args=args,
+        model=model,
+        model_name=model_name,
+        quantization_config=None,
+        transform_ue8m0=False,
+        include_static=False,
+    )
+    # One writer owns complete expert groups, even across iterator buckets and
+    # node boundaries. All ranks still participate in TP/EP weight collection.
+    writer = _SafetensorShardWriter(path, enabled=is_writer)
+    next_shard = 0
+    for chunk in iterator.get_hf_weight_chunks(
+        dict(named_params_and_buffers(args, model)),
+        progress_desc=progress_desc,
+        should_convert_chunk=lambda _idx: is_writer,
+    ):
+        error = None
+        if is_writer:
+            try:
+                writer.write(exporter.convert(chunk), shard_idx=next_shard)
+            except Exception as exc:
+                error = repr(exc)
+        _raise_if_rank_zero_failed("export Qwen4-Exp live weights", error)
+        next_shard += 1
+
+    error = None
+    if is_writer:
+        try:
+            for tensor in exporter.static_tensors():
+                writer.write([tensor], shard_idx=next_shard)
+                next_shard += 1
+        except Exception as exc:
+            error = repr(exc)
+    _raise_if_rank_zero_failed("complete Qwen4-Exp source tensors", error)
+    _finalize_distributed_shards(path, writer.state())
+    if is_writer:
+        logger.info("Successfully saved complete Qwen4-Exp HuggingFace model to %s", path)
 
 
 class _SafetensorShardWriter:

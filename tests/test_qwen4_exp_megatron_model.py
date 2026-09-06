@@ -115,7 +115,8 @@ def test_runtime_contract_rejects_sequence_above_qsa_budget():
 
 
 @pytest.mark.integration
-def test_full_megatron_shell_builds_and_runs_tiny_packed_graph(monkeypatch):
+def test_megatron_shell_packed_graph_with_stubbed_gdn_and_mlp(monkeypatch):
+    """Check model wiring on CPU; this is not a real GDN/MoE or RL closure test."""
     if dist.is_initialized():
         pytest.skip("test owns its world-size-one process group")
     p0_config = tiny_config()

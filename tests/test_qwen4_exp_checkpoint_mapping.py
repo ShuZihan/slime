@@ -8,12 +8,9 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("safetensors")
 pytest.importorskip("transformers")
 
-from slime.backends.megatron_utils.hf_to_megatron.qwen4_exp import Qwen4ExpHfLoader, _merge_gated_qkv
 from slime.backends.megatron_utils.hf_to_megatron.common import SafetensorReader
-from slime.backends.megatron_utils.megatron_to_hf.qwen4_exp import (
-    _unpack_gated_qkv,
-    convert_qwen4_exp_to_hf,
-)
+from slime.backends.megatron_utils.hf_to_megatron.qwen4_exp import Qwen4ExpHfLoader
+from slime.backends.megatron_utils.megatron_to_hf.qwen4_exp import convert_qwen4_exp_to_hf
 
 from test_qwen4_exp_reference import tiny_config
 
@@ -57,25 +54,42 @@ def test_safetensor_reader_materializes_only_the_requested_rows(tmp_path):
 
 
 @pytest.mark.unit
-def test_gated_qkv_mapping_round_trips_checkpoint_head_order():
-    args = SimpleNamespace(
-        num_attention_heads=2,
-        num_query_groups=1,
-        kv_channels=4,
-        hidden_size=8,
-    )
-    q_gate = torch.arange(16 * 8, dtype=torch.float32).reshape(16, 8)
-    key = 1000 + torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8)
-    value = 2000 + torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8)
-    reader = FakeReader({"layer.q_proj.weight": q_gate, "layer.k_proj.weight": key, "layer.v_proj.weight": value})
-    config = SimpleNamespace(num_attention_heads=2, num_key_value_heads=1, head_dim=4)
+def test_qsa_mapping_round_trips_the_actual_p0_model_parameters():
+    from slime_plugins.models.qwen4_exp.reference import Qwen4ExpQSA
 
-    packed = _merge_gated_qkv(reader, "layer", config)
-    actual_q_gate, actual_key, actual_value = _unpack_gated_qkv(args, packed)
+    model = Qwen4ExpQSA(tiny_config())
+    prefix = "model.language_model.layers.3.self_attn"
+    source = {
+        f"{prefix}.{name}": torch.arange(parameter.numel()).reshape_as(parameter).float() + index * 1000
+        for index, (name, parameter) in enumerate(model.named_parameters())
+    }
+    reader = FakeReader(source)
+    loader = Qwen4ExpHfLoader()
+    for name, parameter in model.named_parameters():
+        megatron_name = f"decoder.layers.3.self_attention.{name}"
+        loaded = loader(megatron_name, reader, SimpleNamespace())
+        assert loaded.shape == parameter.shape
+        [(hf_name, exported)] = convert_qwen4_exp_to_hf(SimpleNamespace(), megatron_name, loaded)
+        assert hf_name == f"{prefix}.{name}"
+        torch.testing.assert_close(exported, source[hf_name], rtol=0, atol=0)
 
-    torch.testing.assert_close(actual_q_gate, q_gate)
-    torch.testing.assert_close(actual_key, key)
-    torch.testing.assert_close(actual_value, value)
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "name",
+    [
+        "decoder.layers.3.self_attention.linear_qkv.weight",
+        "decoder.layers.3.self_attention.linear_proj.weight",
+        "decoder.layers.3.self_attention.q_layernorm.weight",
+        "decoder.layers.3.self_attention.k_layernorm.weight",
+        "hyper_connection_mixer.hc_norm.weight",
+    ],
+)
+def test_mapping_rejects_names_outside_the_p0_model(name):
+    with pytest.raises(KeyError, match="unsupported Qwen4-Exp Megatron parameter"):
+        Qwen4ExpHfLoader()(name, FakeReader({}), SimpleNamespace())
+    with pytest.raises(ValueError, match="unknown Qwen4-Exp parameter name"):
+        convert_qwen4_exp_to_hf(SimpleNamespace(), name, torch.zeros(2, 2))
 
 
 @pytest.mark.unit

@@ -46,26 +46,9 @@ class Qwen4ExpPackedLayout:
         return zip(self.boundaries[:-1], self.boundaries[1:])
 
 
-def _grouped_rms_norm(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-    group_size: int,
-    eps: float,
-) -> torch.Tensor:
+class _Qwen4ExpGroupedRMSNorm(nn.Module):
     """Qwen4-Exp zero-centered grouped RMSNorm."""
 
-    if hidden_states.shape[-1] % group_size:
-        raise ValueError("the hidden dimension must be divisible by group_size")
-    if weight.shape != (hidden_states.shape[-1],):
-        raise ValueError("RMSNorm weight shape must match the hidden dimension")
-    original_dtype = hidden_states.dtype
-    grouped = hidden_states.float().unflatten(-1, (-1, group_size))
-    normalized = grouped * torch.rsqrt(grouped.square().mean(dim=-1, keepdim=True) + eps)
-    normalized = normalized.flatten(-2)
-    return (normalized * (1.0 + weight.float())).to(original_dtype)
-
-
-class _Qwen4ExpGroupedRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, group_size: int, eps: float):
         super().__init__()
         if hidden_size % group_size:
@@ -75,7 +58,14 @@ class _Qwen4ExpGroupedRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return _grouped_rms_norm(hidden_states, self.weight, self.group_size, self.eps)
+        if hidden_states.shape[-1] % self.group_size:
+            raise ValueError("the hidden dimension must be divisible by group_size")
+        if self.weight.shape != (hidden_states.shape[-1],):
+            raise ValueError("RMSNorm weight shape must match the hidden dimension")
+        grouped = hidden_states.float().unflatten(-1, (-1, self.group_size))
+        normalized = grouped * torch.rsqrt(grouped.square().mean(dim=-1, keepdim=True) + self.eps)
+        normalized = normalized.flatten(-2)
+        return (normalized * (1.0 + self.weight.float())).to(hidden_states.dtype)
 
 
 class Qwen4ExpGatedResidual(nn.Module):
@@ -202,52 +192,6 @@ class Qwen4ExpNGramLayout:
         )
 
 
-def _build_ngram_ids(
-    input_ids: torch.Tensor,
-    packed_layout: Qwen4ExpPackedLayout,
-    ngram_layout: Qwen4ExpNGramLayout,
-    ngram_size: int,
-    heads_per_ngram: int,
-    eos_token_id: int,
-) -> torch.Tensor:
-    """Hash n-grams while treating every packed sample start as an EOS boundary."""
-
-    flat_ids = input_ids.reshape(-1).long()
-    if flat_ids.numel() != packed_layout.positions.numel():
-        raise ValueError("input_ids and packed layout have different token counts")
-    device = flat_ids.device
-    multipliers = ngram_layout.multipliers.to(device)
-    head_vocab_sizes = ngram_layout.head_vocab_sizes.to(device)
-    head_offsets = ngram_layout.head_offsets.to(device)
-
-    token_positions = torch.arange(flat_ids.numel(), device=device, dtype=torch.long)
-    sample_starts = token_positions - packed_layout.positions.to(device)
-    eos_positions = torch.where(flat_ids == eos_token_id, token_positions, -1)
-    previous_eos_inclusive = torch.cummax(eos_positions, dim=0).values
-    previous_eos = torch.cat((eos_positions.new_full((1,), -1), previous_eos_inclusive[:-1]))
-    lexical_segment_starts = torch.maximum(sample_starts, previous_eos + 1)
-
-    shifted_tokens = [flat_ids]
-    for shift in range(1, ngram_size):
-        source_positions = token_positions - shift
-        valid = token_positions - lexical_segment_starts >= shift
-        shifted = flat_ids.new_full(flat_ids.shape, eos_token_id)
-        shifted[valid] = flat_ids[source_positions[valid]]
-        shifted_tokens.append(shifted)
-
-    blocks = []
-    for ngram in range(2, ngram_size + 1):
-        start_idx = (ngram - 2) * heads_per_ngram
-        end_idx = start_idx + heads_per_ngram
-        mixed_ids = shifted_tokens[0] * multipliers[0]
-        for position in range(1, ngram):
-            mixed_ids = torch.bitwise_xor(mixed_ids, shifted_tokens[position] * multipliers[position])
-        sizes = head_vocab_sizes[start_idx:end_idx]
-        offsets = head_offsets[start_idx:end_idx]
-        blocks.append(torch.remainder(mixed_ids.unsqueeze(-1), sizes) + offsets)
-    return torch.cat(blocks, dim=-1)
-
-
 class _Qwen4ExpNGramEmbedding(nn.Module):
     """Small/reference PLE table with checkpoint-compatible buffer names."""
 
@@ -259,11 +203,11 @@ class _Qwen4ExpNGramEmbedding(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.layout = Qwen4ExpNGramLayout.from_config(config, ple_layer_index)
-        self.register_buffer("layer_multipliers", self.layout.multipliers.clone())
-        self.register_buffer("ngram_heads_vocab_sizes", self.layout.head_vocab_sizes.clone())
-        self.register_buffer("ngram_heads_offsets", self.layout.head_offsets.clone())
-        num_embeddings = self.layout.padded_vocab_size
+        layout = Qwen4ExpNGramLayout.from_config(config, ple_layer_index)
+        self.register_buffer("layer_multipliers", layout.multipliers)
+        self.register_buffer("ngram_heads_vocab_sizes", layout.head_vocab_sizes)
+        self.register_buffer("ngram_heads_offsets", layout.head_offsets)
+        num_embeddings = layout.padded_vocab_size
         embedding_dim = config.ple_embed_dim // config.ple_num_heads
         self.ngram_embedding = (
             nn.Embedding(num_embeddings, embedding_dim)
@@ -273,20 +217,42 @@ class _Qwen4ExpNGramEmbedding(nn.Module):
         self.ngram_embedding.weight.requires_grad_(False)
 
     def forward(self, input_ids: torch.Tensor, packed_layout: Qwen4ExpPackedLayout) -> torch.Tensor:
-        runtime_layout = Qwen4ExpNGramLayout(
-            multipliers=self.layer_multipliers,
-            head_vocab_sizes=self.ngram_heads_vocab_sizes,
-            head_offsets=self.ngram_heads_offsets,
-            padded_vocab_size=self.layout.padded_vocab_size,
-        )
-        ngram_ids = _build_ngram_ids(
-            input_ids,
-            packed_layout,
-            runtime_layout,
-            self.config.ngram_size,
-            self.config.heads_per_ngram,
-            self.config.eos_token_id,
-        )
+        """Hash n-grams from registered buffers, resetting history at EOS/sample starts."""
+
+        flat_ids = input_ids.reshape(-1).long()
+        if flat_ids.numel() != packed_layout.positions.numel():
+            raise ValueError("input_ids and packed layout have different token counts")
+        device = flat_ids.device
+        multipliers = self.layer_multipliers.to(device)
+        head_vocab_sizes = self.ngram_heads_vocab_sizes.to(device)
+        head_offsets = self.ngram_heads_offsets.to(device)
+
+        token_positions = torch.arange(flat_ids.numel(), device=device, dtype=torch.long)
+        sample_starts = token_positions - packed_layout.positions.to(device)
+        eos_positions = torch.where(flat_ids == self.config.eos_token_id, token_positions, -1)
+        previous_eos_inclusive = torch.cummax(eos_positions, dim=0).values
+        previous_eos = torch.cat((eos_positions.new_full((1,), -1), previous_eos_inclusive[:-1]))
+        lexical_segment_starts = torch.maximum(sample_starts, previous_eos + 1)
+
+        shifted_tokens = [flat_ids]
+        for shift in range(1, self.config.ngram_size):
+            source_positions = token_positions - shift
+            valid = token_positions - lexical_segment_starts >= shift
+            shifted = flat_ids.new_full(flat_ids.shape, self.config.eos_token_id)
+            shifted[valid] = flat_ids[source_positions[valid]]
+            shifted_tokens.append(shifted)
+
+        blocks = []
+        for ngram in range(2, self.config.ngram_size + 1):
+            start_idx = (ngram - 2) * self.config.heads_per_ngram
+            end_idx = start_idx + self.config.heads_per_ngram
+            mixed_ids = shifted_tokens[0] * multipliers[0]
+            for position in range(1, ngram):
+                mixed_ids = torch.bitwise_xor(mixed_ids, shifted_tokens[position] * multipliers[position])
+            sizes = head_vocab_sizes[start_idx:end_idx]
+            offsets = head_offsets[start_idx:end_idx]
+            blocks.append(torch.remainder(mixed_ids.unsqueeze(-1), sizes) + offsets)
+        ngram_ids = torch.cat(blocks, dim=-1)
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
 

@@ -15,8 +15,9 @@ import sys
 import tarfile
 import time
 import traceback
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +26,9 @@ DEFAULT_TESTS = (
     "tests/test_qwen4_exp_hf_config.py",
     "tests/test_qwen4_exp_reference.py",
     "tests/test_qwen4_exp_checkpoint_mapping.py",
+    "tests/test_qwen4_exp_hf_export.py",
+    "tests/utils/test_hf_checkpoint_saver.py",
+    "tests/test_qwen4_exp_distributed_cpu.py",
     "tests/test_qwen4_exp_megatron_layer.py",
     "tests/test_qwen4_exp_megatron_model.py",
     "tests/test_qwen4_exp_packed_data.py",
@@ -61,6 +65,8 @@ _CRITICAL_SLIME_SOURCES = (
     "slime/backends/megatron_utils/arguments.py",
     "slime/backends/megatron_utils/data.py",
     "slime/backends/megatron_utils/hf_to_megatron/qwen4_exp.py",
+    "slime/backends/megatron_utils/hf_checkpoint_saver.py",
+    "slime/backends/megatron_utils/qwen4_exp_hf_export.py",
     "slime/backends/megatron_utils/megatron_to_hf/qwen4_exp.py",
     "slime/backends/megatron_utils/update_weight/__init__.py",
     "slime/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py",
@@ -212,7 +218,7 @@ def _ray_node_probe(
     try:
         import socket
 
-        import megatron
+        import megatron.core as megatron
         import sglang
         import slime
         import transformers
@@ -435,7 +441,7 @@ def _preflight(args: argparse.Namespace, run_dir: Path) -> dict[str, Any]:
         if not args.hf_checkpoint or not args.hf_checkpoint.is_dir():
             raise ValidationFailure("--hf-checkpoint must point to the complete Qwen4-Exp checkpoint")
         details["sglang"] = _module_git_state("sglang", commit_env="SGLANG_BUILD_COMMIT")
-        details["megatron"] = _module_git_state("megatron")
+        details["megatron"] = _module_git_state("megatron.core")
         expected_sglang = pins["sglang"]["commit"]
         expected_megatron = pins["megatron_commit"]
         if details["sglang"]["commit"] != expected_sglang:

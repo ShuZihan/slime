@@ -10,31 +10,11 @@ from slime_plugins.models.qwen4_exp.reference import Qwen4ExpNGramLayout
 from .common import SafetensorReader, strip_mcore_wrappers
 
 
-def _merge_gated_qkv(reader: SafetensorReader, prefix: str, config) -> torch.Tensor:
-    """Pack checkpoint q/gate, k, and v into MCore's per-KV-group layout."""
-
-    query_gate = reader.get_tensor(f"{prefix}.q_proj.weight")
-    key = reader.get_tensor(f"{prefix}.k_proj.weight")
-    value = reader.get_tensor(f"{prefix}.v_proj.weight")
-    num_groups = config.num_key_value_heads
-    queries_per_group = config.num_attention_heads // num_groups
-    head_dim = config.head_dim
-    trailing_shape = query_gate.shape[1:]
-    query_gate = query_gate.reshape(num_groups, queries_per_group, 2, head_dim, *trailing_shape)
-    query_gate = query_gate.transpose(1, 2).flatten(1, 3)
-    key = key.reshape(num_groups, head_dim, *trailing_shape)
-    value = value.reshape(num_groups, head_dim, *trailing_shape)
-    return torch.cat((query_gate, key, value), dim=1).reshape(-1, *trailing_shape).contiguous()
-
-
 def _read_expert(reader: SafetensorReader, name: str, expert_idx: int) -> torch.Tensor:
     shape = reader.get_shape(name)
     if not shape or not 0 <= expert_idx < shape[0]:
         raise IndexError(f"expert {expert_idx} is outside {name} with shape {shape}")
-    get_tensor_slice = getattr(reader, "get_tensor_slice", None)
-    if get_tensor_slice is not None:
-        return get_tensor_slice(name, expert_idx).contiguous()
-    return reader.get_tensor(name)[expert_idx].contiguous()
+    return reader.get_tensor_slice(name, expert_idx).contiguous()
 
 
 class Qwen4ExpHfLoader:
@@ -49,7 +29,7 @@ class Qwen4ExpHfLoader:
     }
 
     def __call__(self, name: str, reader: SafetensorReader, hf_config) -> torch.Tensor:
-        name = strip_mcore_wrappers(name).removeprefix("language_model.")
+        name = strip_mcore_wrappers(name)
         direct_mapping = {
             "embedding.word_embeddings.weight": "model.language_model.embed_tokens.weight",
             "output_layer.weight": "lm_head.weight",
@@ -59,36 +39,28 @@ class Qwen4ExpHfLoader:
         if name.startswith("decoder.final_layernorm."):
             suffix = name.removeprefix("decoder.final_layernorm.")
             return reader.get_tensor(f"model.language_model.hyper_connection_mixer.{suffix}")
-        if name.startswith("hyper_connection_mixer."):
-            return reader.get_tensor(f"model.language_model.{name}")
 
         layer_match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)
         if not layer_match:
             raise KeyError(f"unsupported Qwen4-Exp Megatron parameter {name!r}")
         layer_idx, rest = layer_match.groups()
         prefix = f"model.language_model.layers.{layer_idx}"
-        config = getattr(hf_config, "text_config", hf_config)
 
         for direct_prefix in ("attn_hyper_connection.", "mlp_hyper_connection.", "linear_attn.", "ple."):
             if rest.startswith(direct_prefix) and rest != self._PLE_PARAMETER:
                 return reader.get_tensor(f"{prefix}.{rest}")
 
         attention_mapping = {
-            "self_attention.linear_proj.weight": "self_attn.o_proj.weight",
             "self_attention.q_proj.weight": "self_attn.q_proj.weight",
             "self_attention.k_proj.weight": "self_attn.k_proj.weight",
             "self_attention.v_proj.weight": "self_attn.v_proj.weight",
             "self_attention.o_proj.weight": "self_attn.o_proj.weight",
             "self_attention.q_norm.weight": "self_attn.q_norm.weight",
             "self_attention.k_norm.weight": "self_attn.k_norm.weight",
-            "self_attention.q_layernorm.weight": "self_attn.q_norm.weight",
-            "self_attention.k_layernorm.weight": "self_attn.k_norm.weight",
             "self_attention.indexer.index_qk_proj.weight": "self_attn.indexer.index_qk_proj.weight",
             "self_attention.indexer.q_layernorm.weight": "self_attn.indexer.q_layernorm.weight",
             "self_attention.indexer.k_layernorm.weight": "self_attn.indexer.k_layernorm.weight",
         }
-        if rest == "self_attention.linear_qkv.weight":
-            return _merge_gated_qkv(reader, f"{prefix}.self_attn", config)
         if rest in attention_mapping:
             return reader.get_tensor(f"{prefix}.{attention_mapping[rest]}")
 
@@ -126,7 +98,7 @@ class Qwen4ExpHfLoader:
         reader: SafetensorReader,
         hf_config,
     ) -> bool:
-        canonical_name = strip_mcore_wrappers(name).removeprefix("language_model.")
+        canonical_name = strip_mcore_wrappers(name)
         layer_match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", canonical_name)
         if not layer_match or layer_match.group(2) != self._PLE_PARAMETER:
             return False
@@ -201,7 +173,7 @@ class Qwen4ExpHfLoader:
         observed = set()
         for model_module in modules:
             for name, buffer in model_module.named_buffers():
-                canonical_name = strip_mcore_wrappers(name).removeprefix("language_model.")
+                canonical_name = strip_mcore_wrappers(name)
                 match = re.fullmatch(
                     r"decoder\.layers\.(\d+)\.ple\.ple_embedding\.([^\.]+)", canonical_name
                 )

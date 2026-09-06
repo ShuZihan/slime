@@ -11,6 +11,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 
 from slime.utils import accelerator
 
@@ -26,30 +27,9 @@ from .reference import (
 )
 
 
-def _module_device(config):
-    if config.use_cpu_initialization:
-        return torch.device("cpu")
-    return accelerator.current_device()
-
-
 def _place_replicated_module(module: torch.nn.Module, config) -> torch.nn.Module:
-    return module.to(device=_module_device(config), dtype=config.params_dtype)
-
-
-def _gather_sequence_parallel(hidden_states: torch.Tensor, config, tp_group):
-    if not config.sequence_parallel:
-        return hidden_states
-    return tensor_parallel.gather_from_sequence_parallel_region(
-        hidden_states,
-        tensor_parallel_output_grad=False,
-        group=tp_group,
-    )
-
-
-def _scatter_sequence_parallel(hidden_states: torch.Tensor, config, tp_group):
-    if not config.sequence_parallel:
-        return hidden_states
-    return tensor_parallel.scatter_to_sequence_parallel_region(hidden_states, group=tp_group)
+    device = torch.device("cpu") if config.use_cpu_initialization else accelerator.current_device()
+    return module.to(device=device, dtype=config.params_dtype)
 
 
 class Qwen4ExpTransformerLayer(MegatronModule, BaseTransformerLayer):
@@ -72,9 +52,7 @@ class Qwen4ExpTransformerLayer(MegatronModule, BaseTransformerLayer):
         BaseTransformerLayer.__init__(self)
         del vp_stage
         self.layer_number = layer_number
-        self.args = args
         self.p0_config = p0_config
-        self.layer_type = layer_type
         self.tp_group = pg_collection.tp
 
         self.attn_hyper_connection = _place_replicated_module(Qwen4ExpGatedResidual(p0_config), config)
@@ -119,6 +97,23 @@ class Qwen4ExpTransformerLayer(MegatronModule, BaseTransformerLayer):
     def get_qkv_layer_norm_weights(self):
         return None
 
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        state = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        if self.ple is not None:
+            # PLE's plain nn.Module wrappers hide the nested vocab-parallel
+            # embedding hook from MCore's default checkpoint traversal. Replace
+            # that entry with the embedding's TP row offsets and global shape.
+            table = self.ple.ple_embedding.ngram_embedding
+            state.update(
+                table.sharded_state_dict(
+                    prefix=f"{prefix}ple.ple_embedding.ngram_embedding.",
+                    sharded_offsets=sharded_offsets,
+                    metadata=metadata,
+                )
+            )
+        return state
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -156,7 +151,11 @@ class Qwen4ExpTransformerLayer(MegatronModule, BaseTransformerLayer):
         if packed_layout is None or input_ids is None:
             raise ValueError("Qwen4-Exp packed metadata was not bound by Qwen4ExpGPTModel")
 
-        hidden_states = _gather_sequence_parallel(hidden_states, self.config, self.tp_group)
+        if self.config.sequence_parallel:
+            # The replicated attention/mHC/PLE path consumes the full sequence.
+            hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+                hidden_states, tensor_parallel_output_grad=False, group=self.tp_group
+            )
         if hidden_states.shape[-1] == self.p0_config.hidden_size:
             hidden_states = hidden_states.repeat(1, 1, self.p0_config.hyper_connection_count)
         if hidden_states.shape[-1] != self.p0_config.hyper_connection_width:
@@ -181,7 +180,7 @@ class Qwen4ExpTransformerLayer(MegatronModule, BaseTransformerLayer):
         if self.config.sequence_parallel:
             widths = (mixed.shape[-1], residual.shape[-1], injection.shape[-1])
             packed = torch.cat((mixed, residual, injection), dim=-1)
-            packed = _scatter_sequence_parallel(packed, self.config, self.tp_group)
+            packed = tensor_parallel.scatter_to_sequence_parallel_region(packed, group=self.tp_group)
             mixed, residual, injection = torch.split(packed, widths, dim=-1)
             if padding_mask is not None:
                 raise ValueError("Qwen4-Exp P0 does not accept a separate MoE padding mask")
@@ -203,6 +202,10 @@ class Qwen4ExpGPTModel(GPTModel):
         self.decoder.final_layernorm = _place_replicated_module(
             Qwen4ExpGatedResidual(p0_config, use_combine=False), self.config
         )
+        # The final mixer sees sequence shards, unlike each layer's mHC mixers,
+        # which run after an SP gather. MCore must SUM its partial token gradients.
+        for parameter in self.decoder.final_layernorm.parameters():
+            parameter.sequence_parallel = self.config.sequence_parallel
 
     def forward(self, input_ids, position_ids, attention_mask, *args, packed_seq_params=None, **kwargs):
         if packed_seq_params is None:
@@ -270,6 +273,9 @@ def get_qwen4_exp_model_provider(args, config, vp_stage):
     p0_config = Qwen4ExpP0Config.from_hf_config(hf_config)
     p0_config.validate_public_release_contract()
     _validate_p0_runtime(args, p0_config)
+    # PLE exists only on selected layers, and GDN/QSA have different parameters.
+    # Do not depend on a launch script's moe_layer_freq list to select per-layer keys.
+    config.hetereogenous_dist_checkpoint = True
 
     block_spec = copy.deepcopy(
         get_gpt_decoder_block_spec(
